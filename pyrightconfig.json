@@ -1,0 +1,7 @@
+{
+  "venvPath": "../../hermes-agent",
+  "venv": "venv",
+  "extraPaths": ["../../hermes-agent"],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "topoi",
+  "label": "Topics",
+  "description": "Manage the topics your chats are grouped under, and choose where cron job results land by default.",
+  "icon": "Star",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/topics",
+    "position": "after:sessions"
+  },
+  "slots": ["sessions:top"],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
