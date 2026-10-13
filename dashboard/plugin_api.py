@@ -7,7 +7,7 @@ Routes (CONTRACT.md section 3):
 - ``GET /topics`` - the registry: entries, order, home. Bindings are server-side only and never shipped as a map.
 - ``PUT /topics`` - store a client-sent registry; 422 with the refusal reason on a bad one.
 - ``GET /threads`` - session rows resolved to topics, paged, newest first; only threads filed under a live topic are listed.
-- ``POST /threads/bind`` - file one session under a topic (the desktop half's thread-creation flow).
+- ``POST /threads/bind`` - file one session under a topic, or move one that is already filed (the desktop half's thread-creation flow and the row menu's Move to topic).
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
 
 Every registry write broadcasts ``plugin.topoi.topics.changed`` (which reaches desktop windows only when this code runs in the ``hermes serve`` backend process; from the messaging gateway it is a logged no-op). The thread list needs no plugin-side push: the desktop half refetches on the gateway's own ``sessions.changed`` event. Bindings need no broadcast at all: resolution happens server-side on every ``GET /threads``, so a binding is visible to every client the moment it lands.

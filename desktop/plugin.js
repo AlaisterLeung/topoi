@@ -8,7 +8,8 @@
 // A New thread click files the chat the app mints under its topic: the bind
 // waits out the session row's lazy write and only ever files a chat that did
 // not exist when the arm was set, and the topic tab's Add to topic action
-// files an existing chat that flow missed.
+// files an existing chat that flow missed. The row menu's Move to topic
+// re-files a thread under another topic, the same bind with a new target.
 //
 // Disk plugin: plain ESM, no build, no JSX (jsx() calls only), and the import
 // allowlist is @hermes/plugin-sdk / react / react/jsx-runtime.
@@ -24,6 +25,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
   DisclosureCaret,
   EmptyState,
@@ -228,6 +232,18 @@ async function archiveThread(thread) {
   }
 }
 
+// Moving a thread is the same bind with another topic: the store upserts by
+// lineage root, so POST /threads/bind files a new thread and moves one that
+// is already filed. The lists refetch once it lands.
+async function moveThread(thread, entry) {
+  try {
+    await bindThread(thread.session_id, entry.id);
+    queryClient.invalidateQueries({ queryKey: ["topoi"] });
+  } catch (error) {
+    host.notifyError(error, `Could not move the thread to ${entry.name ?? entry.id}`);
+  }
+}
+
 // A topic id the registry will accept: t_[a-z0-9_]+ , unique against the
 // existing entries. The t_ prefix is locked into the field: the user types
 // the suffix and cannot remove or alter the prefix. The id is set at topic
@@ -428,6 +444,7 @@ function TopicView({ topicId }) {
                 threads.map((thread) =>
                   jsx(ThreadRow, {
                     deletable: true,
+                    entries,
                     key: thread.lineage_root,
                     onOpen: (sessionId) => openThreadFromTopicTab(sessionId, topicId),
                     showStatus: false,
@@ -638,7 +655,7 @@ const formatAge = (seconds) => {
 // sits in a column that never shrinks while the title truncates against it.
 // The sidebar copy carries the app's session statuses (the open band and the
 // status dot); the topic tab keeps the delete action and nothing else.
-function ThreadRow({ deletable = false, onOpen, showStatus = false, thread }) {
+function ThreadRow({ deletable = false, entries = [], onOpen, showStatus = false, thread }) {
   const [pendingDelete, setPendingDelete] = useState(false);
   const focused = useValue(host.state.focusedStoredSessionId);
   const statuses = useValue(host.state.sessionStatuses ?? EMPTY_STATUSES);
@@ -655,6 +672,9 @@ function ThreadRow({ deletable = false, onOpen, showStatus = false, thread }) {
   const status = showStatus
     ? (statuses[thread.session_id] ?? statuses[thread.lineage_root] ?? "idle")
     : "idle";
+  // The move sub's targets: every registry entry but the thread's own topic
+  // (moving to the same one is a no-op, so it is not offered).
+  const others = entries.filter((item) => item.id !== thread.topic_id);
   const dot = DOT_CLASS[status]
     ? jsx("span", {
         "aria-label": DOT_LABEL[status],
@@ -706,6 +726,29 @@ function ThreadRow({ deletable = false, onOpen, showStatus = false, thread }) {
                   "Branch from here",
                 ],
               }),
+              others.length > 0 &&
+                jsxs(ContextMenuSub, {
+                  children: [
+                    jsxs(ContextMenuSubTrigger, {
+                      children: [
+                        jsx(Codicon, { name: "move", size: "0.875rem" }),
+                        "Move to topic",
+                      ],
+                    }),
+                    jsxs(ContextMenuSubContent, {
+                      children: others.map((entry) =>
+                        jsx(ContextMenuItem, {
+                          key: entry.id,
+                          onSelect: () => moveThread(thread, entry),
+                          children: [
+                            jsx(Codicon, { name: "tag", size: "0.875rem" }),
+                            entry.name ?? entry.id,
+                          ],
+                        }),
+                      ),
+                    }),
+                  ],
+                }),
               jsx(ContextMenuSeparator, {}),
               jsx(ContextMenuItem, {
                 onSelect: () => archiveThread(thread),
@@ -789,7 +832,7 @@ function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
   });
 }
 
-function TopicSection({ entry, expanded, homeId, onOpenTopic, onToggle, threads }) {
+function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle, threads }) {
   const shown = threads.slice(0, PANE_THREADS);
   const hidden = threads.length - shown.length;
   return jsxs("div", {
@@ -805,6 +848,7 @@ function TopicSection({ entry, expanded, homeId, onOpenTopic, onToggle, threads 
       expanded &&
         shown.map((thread) =>
           jsx(ThreadRow, {
+            entries,
             key: thread.lineage_root,
             onOpen: (sessionId) => openThread(sessionId, "tab"),
             showStatus: true,
@@ -874,6 +918,7 @@ function TopicTree() {
             jsx(
               TopicSection,
               {
+                entries,
                 entry: group.entry,
                 expanded: Boolean(expanded[group.entry.id]),
                 homeId,

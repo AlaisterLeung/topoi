@@ -76,6 +76,8 @@ A `source: topoi` session resolves its topic from `chat_id` (the adapter mints t
 
 `POST /threads/bind` with `{session_id, topic_id}` files one session under a topic - the desktop half's New thread flow, which files the chat the app mints once its row exists. The session id is resolved to its lineage root first, so filing a live id survives compression. It answers 404 when the session does not exist and 422 when the topic is not a live registry entry or the session_id is missing (a request failing both checks gets the 404, so a client can tell a deleted thread from a deleted topic). The path also sweeps bindings whose session no longer exists, once the store is past a small threshold.
 
+A session that is already filed simply moves: the store upserts by lineage root, so the desktop row menu's Move to topic rides this same route and a re-bind is never refused.
+
 ### 3.5 `DELETE /threads/{session_id}`
 
 `DELETE /threads/{session_id}` deletes one thread. The row, its compression chain and its on-disk transcripts go through the core's own session delete - the same handler the desktop's own delete rides - so an already-absent session is a no-op success and a session under an active turn is a 409. The thread's binding is resolved from its lineage root before the row goes and dropped in the same call, so a deleted thread never leaves a binding behind.
