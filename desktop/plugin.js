@@ -5,11 +5,14 @@
 // through Hermes' native chat (host.openSession), so the conversation
 // surface stays core's.
 //
-// A New thread click files the chat the app mints under its topic: the bind
-// waits out the session row's lazy write and only ever files a chat that did
-// not exist when the arm was set, and the topic tab's Add to topic action
-// files an existing chat that flow missed. The row menu's Move to topic
-// re-files a thread under another topic, the same bind with a new target.
+// A New thread click files the chat the app mints under its topic: the arm
+// waits for the draft's first send however long that takes and is mirrored
+// into ctx.storage, so an app restart or a plugin reload restores it; the
+// bind waits out the session row's lazy write, and it only ever files a
+// chat that did not exist when the arm was set - the topic tab's Add to
+// topic action files an existing chat that flow missed. The row menu's
+// Move to topic re-files a thread under another topic, the same bind with a
+// new target.
 //
 // Disk plugin: plain ESM, no build, no JSX (jsx() calls only), and the import
 // allowlist is @hermes/plugin-sdk / react / react/jsx-runtime.
@@ -48,14 +51,17 @@ import { jsx, jsxs } from "react/jsx-runtime";
 // (its Load more button appends the next page of the same size).
 const PANE_THREADS = 4;
 const PAGE_SIZE = 10;
-// A New thread click arms a filing that waits for the chat to mint its
-// session: the app writes the session row on the first prompt, never on the
-// click, so the bind retries for as long as the arm lives, and the arm
-// expires with this window. Generous because the misfire guard below makes
-// a long window safe: a chat that already existed when the arm was set can
-// never be filed by it, so waiting costs nothing.
-const NEW_THREAD_WINDOW_MS = 15 * 60 * 1000;
+// The bind retries only long enough for the session row to appear: the app
+// writes it when the first prompt is processed, a moment after the re-home
+// that fired this filing. The arm behind it never expires by time - it waits
+// for the draft's first send however long that takes and is replaced by the
+// next New thread click - so a long think before sending still files.
+const BIND_ROW_GRACE_MS = 2 * 60 * 1000;
 const BIND_RETRY_MS = 700;
+// The arm's durable mirror in ctx.storage (localStorage-backed), so an app
+// restart or a desktop-plugin reload inside its life restores the filing
+// instead of losing it.
+const PENDING_THREAD_KEY = "pendingThread";
 
 // Disk plugins are not Tailwind-scanned, so the tree's own layout lives here;
 // the SDK components (Button, Badge, ScrollArea, Input) own their chrome.
@@ -139,6 +145,45 @@ const topicTabs = new Map();
 // atom so the composer banner re-renders when the arm changes.
 const $pendingThread = atom(null);
 
+// The atom is the live copy and ctx.storage the durable mirror, so an app
+// restart or a desktop-plugin reload inside the arm's life restores it
+// instead of losing the filing. Every mutation goes through here.
+const setPendingThread = (next) => {
+  $pendingThread.set(next);
+  if (next) {
+    storage?.set(PENDING_THREAD_KEY, {
+      at: next.at,
+      known: next.known ? [...next.known] : null,
+      seenId: next.seenId,
+      topicId: next.topicId,
+      topicName: next.topicName,
+    });
+  } else {
+    storage?.remove?.(PENDING_THREAD_KEY);
+  }
+};
+
+// Restores an arm a previous session persisted and refreshes its snapshot,
+// so chats minted during the gap still cannot consume the arm.
+function restorePendingThread() {
+  const stored = storage?.get(PENDING_THREAD_KEY, null);
+  if (!stored || typeof stored.topicId !== "string" || !stored.topicId) return;
+  const at = typeof stored.at === "number" ? stored.at : Date.now();
+  setPendingThread({
+    at,
+    known: Array.isArray(stored.known) ? new Set(stored.known) : null,
+    seenId: typeof stored.seenId === "string" ? stored.seenId : null,
+    topicId: stored.topicId,
+    topicName: typeof stored.topicName === "string" ? stored.topicName : stored.topicId,
+  });
+  void knownSessionIds().then((known) => {
+    const pending = $pendingThread.get();
+    if (pending && known && pending.at === at) {
+      setPendingThread({ ...pending, known });
+    }
+  });
+}
+
 const TOPICS_KEY = (scope) => ["topoi", "topics", scope];
 const THREADS_KEY = (scope) => ["topoi", "threads", scope];
 const TOPIC_PAGE_KEY = (scope, topicId, limit) => ["topoi", "topic", scope, topicId, limit];
@@ -210,7 +255,7 @@ async function branchThread(thread) {
     // A branch copies its parent's transcript, so its row is seeded and the
     // tab can hydrate it; only a branch of a never-sent chat would be lazy.
     await host.openSession(sessionId, { intent: "tab", ...(profile ? { profile } : {}) });
-    await fileThread(sessionId, thread.topic_id, "the branch", Date.now());
+    await fileThread(sessionId, thread.topic_id, "the branch");
   } catch (error) {
     host.notifyError(error, "Could not branch the thread");
   }
@@ -528,7 +573,7 @@ function startNewThread(entry) {
   }
   const name = entry.name ?? entry.id;
   const at = Date.now();
-  $pendingThread.set({
+  setPendingThread({
     at,
     known: null,
     seenId: host.state?.focusedStoredSessionId?.get?.() ?? null,
@@ -541,7 +586,7 @@ function startNewThread(entry) {
   void knownSessionIds().then((known) => {
     const pending = $pendingThread.get();
     if (pending && pending.at === at) {
-      $pendingThread.set({ ...pending, known });
+      setPendingThread({ ...pending, known });
     }
   });
   host.newChat();
@@ -555,11 +600,11 @@ const isMissingSession = (error) =>
 // Files a chat under its topic, waiting out the row write. The row lands
 // when the first prompt is processed, which is after the re-home that armed
 // this filing, so the first attempts 404 by design; anything else is a real
-// refusal and gives up at once. The wait is bounded by the arm's own
-// window, so a first message carrying attachments (or a busy backend) still
-// files instead of silently staying a regular desktop session.
-async function fileThread(sessionId, topicId, topicName, at) {
-  const deadline = at + NEW_THREAD_WINDOW_MS;
+// refusal and gives up at once. The wait covers only the row write - a first
+// message carrying attachments delays prompt.submit by seconds - because the
+// arm itself never expires.
+async function fileThread(sessionId, topicId, topicName) {
+  const deadline = Date.now() + BIND_ROW_GRACE_MS;
   for (;;) {
     try {
       await bindThread(sessionId, topicId);
@@ -581,15 +626,11 @@ function watchNewThreads() {
   return focused.listen((sessionId) => {
     const pending = $pendingThread.get();
     if (!pending || !sessionId || sessionId === pending.seenId) return;
-    if (Date.now() - pending.at > NEW_THREAD_WINDOW_MS) {
-      $pendingThread.set(null);
-      return;
-    }
     // A chat that already existed when the arm was set is the user visiting
     // another chat, not the new one: it must not consume the arm.
     if (pending.known?.has(sessionId)) return;
-    $pendingThread.set(null);
-    fileThread(sessionId, pending.topicId, pending.topicName, pending.at);
+    setPendingThread(null);
+    fileThread(sessionId, pending.topicId, pending.topicName);
   });
 }
 
@@ -1200,6 +1241,10 @@ export default {
     style.textContent = CSS;
     document.head.append(style);
     ctx.onDispose(() => style.remove());
+
+    // An arm a previous session persisted survives the restart or reload
+    // that brought this register() back.
+    restorePendingThread();
 
     // Registry changes arrive over the gateway event stream; thread lists and
     // open topic tabs refresh on the gateway's own sessions.changed. Bindings
