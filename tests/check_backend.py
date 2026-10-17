@@ -158,6 +158,62 @@ def main() -> int:
         threads["threads"],
     )
 
+    # The row preview is a thread's LATEST turn, never the store's opening-prompt
+    # ``preview`` column: it is what a client renders under the row's title.
+    preview_db = SessionDB()
+    try:
+        preview_db.append_message("sess_plain_tip", "user", "first line of the thread")
+        preview_db.append_message(
+            "sess_plain_tip", "assistant", "answer\nwith a newline"
+        )
+        preview_db.append_message(
+            "sess_plain_tip", "tool", '{"output": "machine payload"}'
+        )
+    finally:
+        preview_db.close()
+    preview = asyncio.run(api.get_threads("t_test", 5, 0, None))
+    check(
+        "a listed row previews the newest user or assistant turn, one line, tool rows skipped",
+        preview["threads"][0]["latest_message"] == "answer with a newline",
+        preview["threads"],
+    )
+    long_db = SessionDB()
+    try:
+        long_db.append_message(
+            "sess_plain_tip", "assistant", "z" * (api.LATEST_MESSAGE_CHARS + 40)
+        )
+    finally:
+        long_db.close()
+    capped = asyncio.run(api.get_threads("t_test", 5, 0, None))
+    check(
+        "an over-long preview is capped at the row width",
+        capped["threads"][0]["latest_message"]
+        == "z" * api.LATEST_MESSAGE_CHARS + "...",
+        capped["threads"],
+    )
+    # A turn in flight writes an empty assistant row plus a machine-payload tool row
+    # per call, so the newest user turn can sit far behind the newest rows. A row
+    # preview that scans a fixed tail goes off the end of the transcript and empties
+    # exactly while the thread is busy, which is what a client paints under the title.
+    busy_db = SessionDB()
+    try:
+        busy_db.append_message("sess_plain_tip", "user", "the prompt that must show")
+        for index in range(12):
+            busy_db.append_message(
+                "sess_plain_tip",
+                "tool",
+                '{"output": "machine payload"}',
+                tool_call_id=f"call_{index}",
+            )
+    finally:
+        busy_db.close()
+    busy = asyncio.run(api.get_threads("t_test", 5, 0, None))
+    check(
+        "a busy thread still previews its latest user turn",
+        busy["threads"][0]["latest_message"] == "the prompt that must show",
+        busy["threads"],
+    )
+
     # The topic filter paginates against the FILTERED set. The t_news match (sess_cron)
     # is the oldest row, so a limit of 1 on the newest-first listing must still surface
     # it; filtering the first `limit` rows returns nothing, and the raw count misreports

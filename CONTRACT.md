@@ -68,7 +68,9 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 - `session_id` - the live chain tip a client opens
 - `lineage_root` - the durable id bindings key on
 - `topic_id` - a live registry entry
-- `title`, `started_at`, `last_active`, `message_count`, `source`
+- `title`, `latest_message`, `started_at`, `last_active`, `message_count`, `source`
+
+`latest_message` is the newest user or assistant text of the thread, whitespace-collapsed to one line and capped at a row-preview width, so a client can render two-line rows without a second call. It is deliberately not the store's own `preview` column: that one is the session's opening user prompt, which answers a title lookup but never the "what happened last" a listing row shows. Tool rows are skipped and the read pages back from the newest row, so the field costs one bounded read per listed row.
 
 A `source: topoi` session resolves its topic from `chat_id` (the adapter mints those for cron deliveries) and never consults the binding store; every other session resolves through the store, keyed by lineage root. Archived, hidden and machinery-source sessions (`kanban`, `tool`) are excluded, mirroring the dashboard's own listing. Query params: `topic` (filter to one), `limit` (1-500, default 200), `offset`, `profile` (defaults to this process's own store). The live-topic filter runs before pagination, so `total` is the filtered count and `offset` walks the filtered rows: a match sitting past the first page is still reachable.
 

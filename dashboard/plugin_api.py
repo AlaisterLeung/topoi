@@ -231,6 +231,45 @@ async def put_topics(body: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+# The row preview's own budget: enough for two lines on a phone row. The text is
+# collapsed to one line, so a multi-line response can never blow the row up.
+LATEST_MESSAGE_CHARS = 240
+
+
+def _latest_message(db: Any, session_id: str) -> str:
+    """The newest user or assistant text of one thread, shaped for a row preview.
+
+    The store is asked which row is the newest of each role (``latest_message_row_id`` already skips the rows that carry no text) and that row is read back, one indexed lookup plus one row each: scanning a fixed tail of rows instead goes off the end of the transcript exactly while a thread is busy, because a running turn writes an empty assistant row plus a machine-payload tool row for every call it makes. Tool rows stay out of the preview, and the store's own ``preview`` column is the session's OPENING user prompt, which is what a title lookup wants but not what a row that tracks recent activity wants.
+    """
+    newest: tuple[int, str] | None = None
+    for role in ("user", "assistant"):
+        try:
+            row_id = db.latest_message_row_id(session_id, role=role)
+            if row_id is None:
+                continue
+            window = db.get_messages_around(session_id, int(row_id), window=0)["window"]
+        except Exception:
+            logger.debug(
+                "[topoi] latest-message read failed for %s", session_id, exc_info=True
+            )
+            return ""
+        if not window:
+            continue
+        text = " ".join(str(window[0].get("content") or "").split())
+        if not text:
+            continue
+        if newest is None or int(row_id) > newest[0]:
+            newest = (int(row_id), text)
+    if newest is None:
+        return ""
+    text = newest[1]
+    return (
+        text[:LATEST_MESSAGE_CHARS] + "..."
+        if len(text) > LATEST_MESSAGE_CHARS
+        else text
+    )
+
+
 @router.get("/threads")
 async def get_threads(
     topic: str | None = None,
@@ -240,7 +279,7 @@ async def get_threads(
 ) -> dict[str, Any]:
     """Session rows resolved to topics, newest activity first, and only those filed under a live topic.
 
-    Each row: ``session_id`` (the live chain tip a client opens), ``lineage_root`` (the durable id bindings key on), ``topic_id`` (always a live registry entry, never null), plus title and activity fields. A session with no topic never appears, and neither does a thread whose topic is no longer a live entry (a deleted topic, including a ``source: topoi`` session whose delivery topic is gone): the filter runs before pagination, so ``total`` counts the listed set and ``offset`` walks it. Archived, hidden and machinery-source sessions are excluded, mirroring the dashboard's own listing. ``topic`` filters to one topic; pass no ``topic`` to list every topic's threads.
+    Each row: ``session_id`` (the live chain tip a client opens), ``lineage_root`` (the durable id bindings key on), ``topic_id`` (always a live registry entry, never null), plus title, ``latest_message`` (the newest user or assistant text, collapsed to one line and capped, read per listed row), and the activity fields. A session with no topic never appears, and neither does a thread whose topic is no longer a live entry (a deleted topic, including a ``source: topoi`` session whose delivery topic is gone): the filter runs before pagination, so ``total`` counts the listed set and ``offset`` walks it. Archived, hidden and machinery-source sessions are excluded, mirroring the dashboard's own listing. ``topic`` filters to one topic; pass no ``topic`` to list every topic's threads.
     """
     scope = {
         "exclude_sources": list(_HIDDEN_SOURCES),
@@ -273,6 +312,7 @@ async def get_threads(
                         "lineage_root": root,
                         "topic_id": topic_id,
                         "title": row.get("title"),
+                        "latest_message": _latest_message(db, tip),
                         "started_at": row.get("started_at"),
                         "last_active": row.get("last_active"),
                         "message_count": row.get("message_count"),
