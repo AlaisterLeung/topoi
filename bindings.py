@@ -97,6 +97,18 @@ def set_binding(root: str, topic_id: str) -> None:
     )
 
 
+def get_binding(root: str) -> str | None:
+    """One root's topic, or ``None`` when it was never filed.
+
+    A targeted read, so the bind guard can check a single root instead of loading the whole map.
+    """
+    rows = _read_all(
+        "SELECT topic_id FROM bindings WHERE lineage_root = ?",
+        (str(root or "").strip(),),
+    )
+    return str(rows[0][0]) if rows else None
+
+
 def clear_binding(root: str) -> None:
     """Remove one binding; a no-op when it was never bound."""
     _apply(

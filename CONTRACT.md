@@ -61,7 +61,7 @@ A session's topic is resolved as follows:
 - A scheduled run (`source: cron`) resolves from its job's delivery lane, a read of the job store rather than a binding.
 - Every other session resolves through the store, keyed by lineage root.
 
-The only write path is `POST /threads/bind`: a client files a freshly created chat under a topic, or moves a listed thread (a scheduled run included) to another one. There is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path. A legacy config-level `bindings` block (left by an earlier build) is ignored on read, adopted into the store once on the first `GET /topics`, and dropped by the next registry write.
+The only write path is `POST /threads/bind`: a client files a freshly created chat under a topic, or moves a listed thread (a scheduled run included) to another one with `move: true`. Without that flag a bind only ever creates a filing: if the thread already sits under a different topic the route answers 409, so a client that fires on the wrong chat cannot relocate it. There is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path. A legacy config-level `bindings` block (left by an earlier build) is ignored on read, adopted into the store once on the first `GET /topics`, and dropped by the next registry write.
 
 An older block may still use the retired `items` / `revision` spellings; they are ignored, never half-read.
 
@@ -97,9 +97,9 @@ Nothing is stored for the cron resolution; the job store is the record. That is 
 
 ### 3.4 `POST /threads/bind`
 
-`POST /threads/bind` with `{session_id, topic_id}` files one session under a topic - the desktop half's New thread flow, which files the chat the app mints once its row exists. The session id is resolved to its lineage root first, so filing a live id survives compression. It answers 404 when the session does not exist and 422 when the topic is not a live registry entry or the session_id is missing (a request failing both checks gets the 404, so a client can tell a deleted thread from a deleted topic). The path also sweeps bindings whose session no longer exists, once the store is past a small threshold.
+`POST /threads/bind` with `{session_id, topic_id}` files one session under a topic - the desktop half's New thread flow, which files the chat the app mints once its row exists. The session id is resolved to its lineage root first, so filing a live id survives compression. It answers 404 when the session does not exist, 422 when the topic is not a live registry entry or the session_id is missing (a request failing both checks gets the 404, so a client can tell a deleted thread from a deleted topic), and 409 when the body files a thread that already sits under another topic without `move: true`. The path also sweeps bindings whose session no longer exists, once the store is past a small threshold.
 
-A session that is already filed simply moves: the store upserts by lineage root, so the desktop row menu's Move to topic rides this same route and a re-bind is never refused.
+Re-filing a session that already sits under another topic needs `{session_id, topic_id, move: true}`, which is what the desktop row menu's Move to topic sends. Both shapes upsert by lineage root; the flag only decides whether that upsert may change a topic that already exists. Without it the answer is 409, so a stale new-thread arm cannot re-topic a thread it mistook for its own.
 
 ### 3.5 `DELETE /threads/{session_id}`
 

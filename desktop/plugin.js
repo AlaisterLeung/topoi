@@ -53,11 +53,17 @@ const PANE_THREADS = 4;
 const PAGE_SIZE = 10;
 // The bind retries only long enough for the session row to appear: the app
 // writes it when the first prompt is processed, a moment after the re-home
-// that fired this filing. The arm behind it never expires by time - it waits
-// for the draft's first send however long that takes and is replaced by the
-// next New thread click - so a long think before sending still files.
+// that fired this filing. An id the app minted but never wrote a row for (a
+// fresh draft nobody sent into, e.g. a new-chat tile) never gets one, so a
+// spent wait is not an error - it drops without a toast. While that draft is
+// still the focused chat the wait keeps going at a slower pace, so a long
+// think before sending still files. The two globals are the rail's seam for
+// shrinking the windows per call; the app never sets them.
 const BIND_ROW_GRACE_MS = 2 * 60 * 1000;
+const BIND_ROW_MAX_MS = 10 * 60 * 1000;
 const BIND_RETRY_MS = 700;
+const BIND_RETRY_SLOW_MS = 2000;
+const bindWindow = (name, fallback) => Number(globalThis[name]) || fallback;
 // The arm's durable mirror in ctx.storage (localStorage-backed), so an app
 // restart or a desktop-plugin reload inside its life restores the filing
 // instead of losing it.
@@ -201,8 +207,15 @@ const fetchThreads = () => rest("/threads");
 const fetchTopicPage = (topicId, limit) =>
   rest(`/threads?topic=${encodeURIComponent(topicId)}&limit=${limit}&offset=0`);
 const putTopics = (state) => rest("/topics", { method: "PUT", body: state });
-const bindThread = (sessionId, topicId) =>
-  rest("/threads/bind", { method: "POST", body: { session_id: sessionId, topic_id: topicId } });
+// `move` is the row menu's Move to topic: the backend refuses to re-topic an
+// existing filing without it, so a misfired filing leaves the thread alone.
+const bindThread = (sessionId, topicId, move = false) =>
+  rest("/threads/bind", {
+    method: "POST",
+    body: move
+      ? { session_id: sessionId, topic_id: topicId, move: true }
+      : { session_id: sessionId, topic_id: topicId },
+  });
 const deleteThread = (sessionId) =>
   rest(`/threads/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 
@@ -277,12 +290,13 @@ async function archiveThread(thread) {
   }
 }
 
-// Moving a thread is the same bind with another topic: the store upserts by
-// lineage root, so POST /threads/bind files a new thread and moves one that
-// is already filed. The lists refetch once it lands.
+// Moving a thread is the same bind with another topic plus the move flag: the
+// store upserts by lineage root, but the backend only re-files an existing
+// binding when the request says move (a plain bind 409s), so a stray filing
+// can never relocate a thread. The lists refetch once it lands.
 async function moveThread(thread, entry) {
   try {
-    await bindThread(thread.session_id, entry.id);
+    await bindThread(thread.session_id, entry.id, true);
     queryClient.invalidateQueries({ queryKey: ["topoi"] });
   } catch (error) {
     host.notifyError(error, `Could not move the thread to ${entry.name ?? entry.id}`);
@@ -597,25 +611,53 @@ function startNewThread(entry) {
 const isMissingSession = (error) =>
   error?.statusCode === 404 || /^404\b/.test(String(error?.message ?? ""));
 
-// Files a chat under its topic, waiting out the row write. The row lands
-// when the first prompt is processed, which is after the re-home that armed
-// this filing, so the first attempts 404 by design; anything else is a real
-// refusal and gives up at once. The wait covers only the row write - a first
-// message carrying attachments delays prompt.submit by seconds - because the
-// arm itself never expires.
+// A 409 means the chat is already filed under another topic. Only the row
+// menu's Move sends the move flag, so a filing that collides with an existing
+// one is a misfire and must leave the thread where it is.
+const isAlreadyFiled = (error) =>
+  error?.statusCode === 409 || /^409\b/.test(String(error?.message ?? ""));
+
+const stillFocused = (sessionId) =>
+  (host.state?.focusedStoredSessionId?.get?.() ?? null) === sessionId;
+
+// Files a chat under its topic, waiting out the row write. The row lands when
+// the first prompt is processed, which is after the re-home that fired this
+// filing, so the first attempts 404 by design; anything else is a real
+// refusal and gives up at once. A 404 that outlives the grace is a draft with
+// no row (nobody sent into it), which is not a failure the user can act on, so
+// it drops silently. While that draft is still focused the wait continues
+// slowly until the hard cap, which is what keeps a long think before the first
+// send from losing the filing.
 async function fileThread(sessionId, topicId, topicName) {
-  const deadline = Date.now() + BIND_ROW_GRACE_MS;
+  const deadline = Date.now() + bindWindow("__TOPOI_BIND_GRACE_MS__", BIND_ROW_GRACE_MS);
+  const cap = Date.now() + bindWindow("__TOPOI_BIND_MAX_MS__", BIND_ROW_MAX_MS);
   for (;;) {
     try {
       await bindThread(sessionId, topicId);
       queryClient.invalidateQueries({ queryKey: ["topoi"] });
       return;
     } catch (error) {
-      if (!isMissingSession(error) || Date.now() >= deadline) {
+      if (isAlreadyFiled(error)) {
+        console.warn(
+          "[topoi] filing skipped, already filed:",
+          sessionId,
+          String(error?.message ?? error),
+        );
+        return;
+      }
+      if (!isMissingSession(error)) {
         host.notifyError(error, `Could not file the new thread under ${topicName || "its topic"}`);
         return;
       }
-      await new Promise((resolve) => setTimeout(resolve, BIND_RETRY_MS));
+      const now = Date.now();
+      const waiting = now < deadline || (now < cap && stillFocused(sessionId));
+      if (!waiting) {
+        console.warn("[topoi] filing dropped, no session row:", sessionId);
+        return;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, now < deadline ? BIND_RETRY_MS : BIND_RETRY_SLOW_MS),
+      );
     }
   }
 }

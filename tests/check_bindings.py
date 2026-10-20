@@ -266,12 +266,38 @@ def main() -> int:
             store.mapping().get("sess_plain") == "t_news",
             store.mapping(),
         )
-        bound_tip = api._bind_core(session_db, "sess_plain_tip", "t_test")
+        # A re-file needs the explicit move flag: a plain bind on an already-filed
+        # root is a conflict, which is what keeps a stale client arm from
+        # relocating a thread (the random-move report).
+        try:
+            api._bind_core(session_db, "sess_plain_tip", "t_test")
+        except api.BindConflict as error:
+            check(
+                "re-filing without move is a BindConflict (409)",
+                "already filed under t_news" in str(error)
+                and store.mapping()["sess_plain"] == "t_news",
+                str(error),
+            )
+        except Exception as error:  # noqa: BLE001 - a wrong exception type is the failure
+            check(
+                "re-filing without move is a BindConflict (409)",
+                False,
+                f"raised {type(error).__name__}: {error}",
+            )
+        else:
+            check("re-filing without move is a BindConflict (409)", False, "accepted")
+        bound_tip = api._bind_core(session_db, "sess_plain_tip", "t_test", move=True)
         check(
             "binding a live id resolves to the lineage root",
             bound_tip["lineage_root"] == "sess_plain"
             and store.mapping()["sess_plain"] == "t_test",
             bound_tip,
+        )
+        same = api._bind_core(session_db, "sess_plain", "t_test")
+        check(
+            "re-filing under the same topic needs no move flag",
+            same["topic_id"] == "t_test" and store.mapping()["sess_plain"] == "t_test",
+            same,
         )
         # The check order: a request that fails both checks is the 404.
         try:

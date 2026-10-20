@@ -7,7 +7,7 @@ Routes (CONTRACT.md section 3):
 - ``GET /topics`` - the registry: entries, order, home. Bindings are server-side only and never shipped as a map.
 - ``PUT /topics`` - store a client-sent registry; 422 with the refusal reason on a bad one.
 - ``GET /threads`` - session rows resolved to topics (adapter-minted ``chat_id``, then the binding store, then a cron run's own job delivery lane), paged, newest first; only threads filed under a live topic are listed.
-- ``POST /threads/bind`` - file one session under a topic, or move one that is already filed (the desktop half's thread-creation flow and the row menu's Move to topic).
+- ``POST /threads/bind`` - file one session under a topic; re-filing one that is already filed elsewhere needs ``move: true`` (the row menu's Move to topic), so a client-side misfire cannot relocate a thread (409 otherwise).
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
 
 Every registry write broadcasts ``plugin.topoi.topics.changed`` (which reaches desktop windows only when this code runs in the ``hermes serve`` backend process; from the messaging gateway it is a logged no-op). The thread list needs no plugin-side push: the desktop half refetches on the gateway's own ``sessions.changed`` event. Bindings need no broadcast at all: resolution happens server-side on every ``GET /threads``, so a binding is visible to every client the moment it lands.
@@ -33,6 +33,13 @@ _DEFAULT_LIMIT = 200
 _MAX_LIMIT = 500
 # The sources the dashboard itself hides from human listings (kanban board and tool runs); the topic list mirrors that so a topic tree never shows machinery sessions.
 _HIDDEN_SOURCES = ("kanban", "tool")
+
+
+class BindConflict(Exception):
+    """A bind that would re-topic an existing filing (409).
+
+    Only an explicit ``move`` may relocate a thread, so a client-side misfire can never do it by accident.
+    """
 
 
 def _load_sibling(name: str):
@@ -286,12 +293,16 @@ def _sync_live_home() -> None:
         logger.debug("[topoi] live home sync failed", exc_info=True)
 
 
-def _bind_core(db: Any, session_id: str, topic_id: str) -> dict[str, Any]:
+def _bind_core(
+    db: Any, session_id: str, topic_id: str, move: bool = False
+) -> dict[str, Any]:
     """File one session under a topic, synchronously.
 
-    Everything the bind endpoint does lives here so a plain sync check can drive it: the required-field check, the lineage walk (a live id resolves to its root, so a mid-thread compression never orphans a binding), topic liveness against the registry, the store write, and the dead-root sweep. The async handler is a thin wrapper that owns the request parsing and the db lifecycle and maps this function's errors to HTTP codes (``LookupError`` -> 404, ``ValueError`` -> 422).
+    Everything the bind endpoint does lives here so a plain sync check can drive it: the required-field check, the lineage walk (a live id resolves to its root, so a mid-thread compression never orphans a binding), topic liveness against the registry, the re-file guard, the store write, and the dead-root sweep. The async handler is a thin wrapper that owns the request parsing and the db lifecycle and maps this function's errors to HTTP codes (``LookupError`` -> 404, ``ValueError`` -> 422, ``BindConflict`` -> 409).
 
     The check order is deliberate: a request that fails both checks is a 404, so a client can tell a deleted thread from a deleted topic.
+
+    A bind may create a filing but never silently re-topic one: an existing binding under another topic is a ``BindConflict`` unless the caller passes ``move`` (the row menu's Move to topic). A thread's topic is fixed once it is filed (Boss's call), so a client-side misfire - a stale new-thread arm catching a chat that was already filed, including one whose session id rotated under compression - is refused instead of relocating the thread.
     """
     if not session_id:
         raise ValueError("session_id is required")
@@ -301,6 +312,9 @@ def _bind_core(db: Any, session_id: str, topic_id: str) -> dict[str, Any]:
     # Liveness against the registry: a binding to a topic no client shows is worse than a refusal.
     if topic_id not in _live_topic_ids():
         raise ValueError(f"unknown topic: {topic_id}")
+    filed = bindings.get_binding(root)
+    if filed is not None and filed != topic_id and not move:
+        raise BindConflict(f"already filed under {filed}: a move must say so")
     # The root came from a real session and the topic from the registry, so the store write cannot shape-fail; a BindingError (a ValueError) would still map to 422.
     bindings.set_binding(root, topic_id)
     bindings.sweep_dead_roots(_session_exists(db))
@@ -453,17 +467,20 @@ async def get_threads(
 async def bind_thread(
     body: dict[str, Any], profile: str | None = None
 ) -> dict[str, Any]:
-    """File one session under a topic.
+    """File one session under a topic, or move one when the request says so.
 
-    The session id is resolved to its lineage root first, so binding a live id survives compression. 404 when the session does not exist; 422 when the topic is not a live registry entry (a request failing both checks gets the 404). The logic lives in ``_bind_core``; this wrapper owns the request parsing and the db lifecycle.
+    The session id is resolved to its lineage root first, so binding a live id survives compression. 404 when the session does not exist; 422 when the topic is not a live registry entry (a request failing both checks gets the 404); 409 when the thread is already filed under another topic and the body does not carry ``move: true``. The logic lives in ``_bind_core``; this wrapper owns the request parsing and the db lifecycle.
     """
     session_id = str((body or {}).get("session_id") or "").strip()
     topic_id = str((body or {}).get("topic_id") or "").strip()
+    move = bool((body or {}).get("move"))
     db = _open_db(profile)
     try:
-        return _bind_core(db, session_id, topic_id)
+        return _bind_core(db, session_id, topic_id, move=move)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except BindConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     finally:
