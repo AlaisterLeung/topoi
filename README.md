@@ -6,6 +6,7 @@ Topoi groups every Hermes Agent chat under different topics in Hermes Desktop, s
 
 - Sessions are grouped by topic as threads
 - View threads and create new ones from the sidebar
+- Search threads by message content from the topic tab
 - Deliver cron job results to topics without a separate messaging platform
 - Reply to cron job threads with continuable session context
 - Add existing sessions to a topic and move threads to a different one

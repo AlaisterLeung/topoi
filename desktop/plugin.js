@@ -44,13 +44,16 @@ import {
   useQueryClient,
   useValue,
 } from "@hermes/plugin-sdk";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { jsx, jsxs } from "react/jsx-runtime";
 
 // Threads a topic section shows when expanded, and one page of a topic tab
 // (its Load more button appends the next page of the same size).
 const PANE_THREADS = 4;
 const PAGE_SIZE = 10;
+// A keystroke is not a query: the topic tab's search box waits out this gap, so
+// typing a word costs one page request instead of one per letter.
+const SEARCH_DEBOUNCE_MS = 220;
 // The bind retries only long enough for the session row to appear: the app
 // writes it when the first prompt is processed, a moment after the re-home
 // that fired this filing. An id the app minted but never wrote a row for (a
@@ -114,6 +117,8 @@ const CSS = `
 .topoi-tab-title{display:flex;align-items:center;gap:6px;font-size:0.875rem;font-weight:600;color:var(--ui-text-primary)}
 .topoi-tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .topoi-tab-meta{font-size:0.6875rem;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
+.topoi-tab-search{padding:0 12px 6px}
+.topoi-search{width:100%}
 .topoi-tab-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
 .topoi-tab-body{flex:1;min-height:0}
 .topoi-load-more{display:flex;justify-content:center;padding:6px 0 10px}
@@ -192,7 +197,8 @@ function restorePendingThread() {
 
 const TOPICS_KEY = (scope) => ["topoi", "topics", scope];
 const THREADS_KEY = (scope) => ["topoi", "threads", scope];
-const TOPIC_PAGE_KEY = (scope, topicId, limit) => ["topoi", "topic", scope, topicId, limit];
+const TOPIC_PAGE_KEY = (scope, topicId, limit, query) =>
+  ["topoi", "topic", scope, topicId, limit, query];
 
 // Queries are scoped by the active connection so a backend switch is a clean
 // cache miss (the kanban roster pattern).
@@ -203,9 +209,15 @@ function useScope() {
 const fetchTopics = () => rest("/topics");
 const fetchThreads = () => rest("/threads");
 // One topic's threads, newest first: `total` is the topic's whole count, so a
-// Load more button knows whether a next page exists.
-const fetchTopicPage = (topicId, limit) =>
-  rest(`/threads?topic=${encodeURIComponent(topicId)}&limit=${limit}&offset=0`);
+// Load more button knows whether a next page exists. A `query` searches the
+// topic's conversations, not the page the tab happens to hold: the backend
+// filters before paginating, so `total` is every match in the topic.
+const fetchTopicPage = (topicId, limit, query = "") =>
+  rest(
+    `/threads?topic=${encodeURIComponent(topicId)}&limit=${limit}&offset=0${
+      query ? `&q=${encodeURIComponent(query)}` : ""
+    }`,
+  );
 const putTopics = (state) => rest("/topics", { method: "PUT", body: state });
 // `move` is the row menu's Move to topic: the backend refuses to re-topic an
 // existing filing without it, so a misfired filing leaves the thread alone.
@@ -351,14 +363,31 @@ function groupThreads(entries, threads) {
 function TopicView({ topicId }) {
   const scope = useScope();
   const [limit, setLimit] = useState(PAGE_SIZE);
+  // The box's text is instant; the query it sends is debounced. A new search
+  // starts at the first page, because the limit a Load more click grew belongs
+  // to the list the user was reading, not to the one they just asked for.
+  const [typed, setTyped] = useState("");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const next = typed.trim();
+    if (next === query) return undefined;
+    const timer = setTimeout(() => {
+      setQuery(next);
+      setLimit(PAGE_SIZE);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [typed, query]);
   const topicsQuery = useQuery({
     queryFn: fetchTopics,
     queryKey: TOPICS_KEY(scope),
     staleTime: 30_000,
   });
   const pageQuery = useQuery({
-    queryFn: () => fetchTopicPage(topicId, limit),
-    queryKey: TOPIC_PAGE_KEY(scope, topicId, limit),
+    // The rows of the last answer stay painted while the next one lands, so a
+    // keystroke never blanks the tab for a round trip.
+    placeholderData: (previous) => previous,
+    queryFn: () => fetchTopicPage(topicId, limit, query),
+    queryKey: TOPIC_PAGE_KEY(scope, topicId, limit, query),
     staleTime: 15_000,
   });
 
@@ -367,6 +396,15 @@ function TopicView({ topicId }) {
   const name = entry?.name ?? topicId;
   const threads = pageQuery.data?.threads ?? [];
   const total = pageQuery.data?.total ?? threads.length;
+  // A search counts matches, not the topic's threads: the row list IS the
+  // answer, and "12 threads" under three matches would read as a bug.
+  const summary = query
+    ? total === 1
+      ? "1 result"
+      : `${total} results`
+    : total === 1
+      ? "1 thread"
+      : `${total} threads`;
   // The recovery door: a chat the New thread flow missed (an expired arm, a
   // bind that lost the row race, a first send after the window) is filed
   // from here by picking it. Only chats not already filed under a topic are
@@ -426,7 +464,7 @@ function TopicView({ topicId }) {
               }),
               jsx("span", {
                 className: "topoi-tab-meta",
-                children: total === 1 ? "1 thread" : `${total} threads`,
+                children: summary,
               }),
             ],
           }),
@@ -453,6 +491,23 @@ function TopicView({ topicId }) {
           }),
         ],
       }),
+      // The search row sits under the head and OUTSIDE the scroll box, so the
+      // field holds its place while the results move beneath it. It stands down
+      // while the Add to topic picker is open, which carries its own filter.
+      !picking &&
+        jsx("div", {
+          className: "topoi-tab-search",
+          children: jsx(Input, {
+            "aria-label": `Search ${name}`,
+            className: "topoi-search",
+            onChange: (event) => setTyped(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === "Escape") setTyped("");
+            },
+            placeholder: "Search this topic",
+            value: typed,
+          }),
+        }),
       jsxs(ScrollArea, {
         className: "topoi-tab-body",
         children: [
@@ -504,6 +559,7 @@ function TopicView({ topicId }) {
                   jsx(ThreadRow, {
                     deletable: true,
                     entries,
+                    hint: thread.match,
                     key: thread.lineage_root,
                     onOpen: (sessionId) => openThreadFromTopicTab(sessionId, topicId),
                     showStatus: false,
@@ -518,10 +574,15 @@ function TopicView({ topicId }) {
                 !pageQuery.isLoading &&
                   !pageQuery.error &&
                   threads.length === 0 &&
-                  jsx(EmptyState, {
-                    description: "Threads show up here once a chat is added to this topic.",
-                    title: "No threads yet",
-                  }),
+                  (query
+                    ? jsx(EmptyState, {
+                        description: `No thread in ${name} mentions it, in any message.`,
+                        title: "No matches",
+                      })
+                    : jsx(EmptyState, {
+                        description: "Threads show up here once a chat is added to this topic.",
+                        title: "No threads yet",
+                      })),
                 threads.length < total &&
                   jsx("div", {
                     className: "topoi-load-more",
@@ -738,7 +799,7 @@ const formatAge = (seconds) => {
 // sits in a column that never shrinks while the title truncates against it.
 // The sidebar copy carries the app's session statuses (the open band and the
 // status dot); the topic tab keeps the delete action and nothing else.
-function ThreadRow({ deletable = false, entries = [], onOpen, showStatus = false, thread }) {
+function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showStatus = false, thread }) {
   const [pendingDelete, setPendingDelete] = useState(false);
   const focused = useValue(host.state.focusedStoredSessionId);
   const statuses = useValue(host.state.sessionStatuses ?? EMPTY_STATUSES);
@@ -776,6 +837,10 @@ function ThreadRow({ deletable = false, entries = [], onOpen, showStatus = false
             children: jsxs("button", {
               className: opened ? "topoi-row-main topoi-open" : "topoi-row-main",
               onClick: () => onOpen(thread.session_id),
+              // A search hit's matched line, on the row's own tooltip: the row
+              // keeps its title-and-date shape, and the answer to "why did this
+              // match?" is one hover away.
+              title: hint || undefined,
               type: "button",
               children: [
                 dot,

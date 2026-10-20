@@ -383,16 +383,104 @@ def _latest_message(db: Any, session_id: str) -> str:
     )
 
 
+# The transcript leg asks the store's FTS index for one ranked page of hits and then keeps the ones filed under a listed topic, so the window has to be wider than the topic's own match count: it is a page of a GLOBAL index, never of the topic.
+SEARCH_HIT_LIMIT = 200
+# A hit from another thread has to be walked to its lineage root before it can be ruled out (one or two indexed lookups), so the walk is memoized and capped; the index's rank order means a cap only drops the least relevant tail.
+SEARCH_WALK_LIMIT = 120
+# A row's hover snippet: a matched line, collapsed and capped, never a whole message.
+SNIPPET_CHARS = 200
+
+
+def _one_line(text: Any, cap: int) -> str:
+    """``text`` collapsed to one line and capped at ``cap``, ellipsised only when something was cut."""
+    collapsed = " ".join(str(text or "").split())
+    return collapsed[:cap] + "..." if len(collapsed) > cap else collapsed
+
+
+def _search_hits(db: Any, needle: str) -> list[tuple[str, str]]:
+    """The store's FTS hits for ``needle``, in rank order, as ``(session_id, snippet)``.
+
+    The store owns the index and the query grammar (phrases, AND/OR/NOT, prefix*, the CJK and substring fallbacks), so search is delegated instead of re-implemented as a LIKE scan. Tool rows and the machinery sources stay out: a hit is something a person said. The snippet's own ``>>>``/``<<<`` highlight markers are stripped, because the row carries it as plain tooltip text. A store that cannot search answers with no hits, which leaves the title and preview legs working.
+    """
+    try:
+        rows = db.search_messages(
+            needle,
+            exclude_sources=list(_HIDDEN_SOURCES),
+            limit=SEARCH_HIT_LIMIT,
+            role_filter=["user", "assistant"],
+        )
+    except Exception:
+        logger.debug("[topoi] thread search failed", exc_info=True)
+        return []
+    hits: list[tuple[str, str]] = []
+    for row in rows:
+        session_id = str(row.get("session_id") or "")
+        if not session_id:
+            continue
+        snippet = str(row.get("snippet") or "").replace(">>>", "").replace("<<<", "")
+        hits.append((session_id, _one_line(snippet, SNIPPET_CHARS)))
+    return hits
+
+
+def _search_matched(
+    db: Any, rows: list[dict[str, Any]], needle: str
+) -> list[dict[str, Any]]:
+    """The members of ``rows`` that match ``needle``, best first.
+
+    Three legs, in the order a person reads them: the transcript (the store's FTS index, rank order, its matched line carried as ``match``), then the title, then the row preview. A transcript hit resolves to its thread through the lineage walk, so a match inside a compaction-archived parent still lands on the live row, and hits for sessions outside ``rows`` are dropped - which is what scopes a global index to one topic. A row matched twice appears once, at its best rank, with its snippet.
+    """
+    lowered = needle.lower()
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        by_id[str(row["session_id"])] = row
+        by_id[str(row["lineage_root"])] = row
+    snippets: dict[str, str] = {}
+    order: list[dict[str, Any]] = []
+    walked: dict[str, str | None] = {}
+    for session_id, snippet in _search_hits(db, needle):
+        row = by_id.get(session_id)
+        if row is None:
+            if session_id not in walked:
+                if len(walked) >= SEARCH_WALK_LIMIT:
+                    continue
+                walked[session_id] = _lineage_root(db, session_id)
+            row = by_id.get(walked[session_id] or "")
+        if row is None:
+            continue
+        root = str(row["lineage_root"])
+        if root in snippets:
+            continue
+        snippets[root] = snippet
+        order.append(row)
+    for row in rows:
+        if str(row["lineage_root"]) in snippets:
+            continue
+        if (
+            lowered in str(row.get("title") or "").lower()
+            or lowered in str(row.get("latest_message") or "").lower()
+        ):
+            order.append(row)
+    return [
+        {**row, "match": snippets[str(row["lineage_root"])]}
+        if snippets.get(str(row["lineage_root"]))
+        else row
+        for row in order
+    ]
+
+
 @router.get("/threads")
 async def get_threads(
     topic: str | None = None,
     limit: int = Query(_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
     offset: int = Query(0, ge=0),
     profile: str | None = None,
+    q: str | None = None,
 ) -> dict[str, Any]:
     """Session rows resolved to topics, newest activity first, and only those filed under a live topic.
 
     Each row: ``session_id`` (the live chain tip a client opens), ``lineage_root`` (the durable id bindings key on), ``topic_id`` (always a live registry entry, never null), plus title, ``latest_message`` (the newest user or assistant text, collapsed to one line and capped, read per listed row), and the activity fields. A session with no topic never appears, and neither does a thread whose topic is no longer a live entry (a deleted topic, including a ``source: topoi`` session whose delivery topic is gone): the filter runs before pagination, so ``total`` counts the listed set and ``offset`` walks it. Archived, hidden and machinery-source sessions are excluded, mirroring the dashboard's own listing. ``topic`` filters to one topic; pass no ``topic`` to list every topic's threads.
+
+    ``q`` searches the listed set (one topic's threads when ``topic`` is given): the transcript through the store's FTS index, then the title and the row preview as substrings, both before pagination so ``total`` counts the matches. A transcript hit carries its matched line as ``match`` (for a row tooltip) and hits rank ahead of title-only matches.
 
     Scheduled runs are listed here too: a ``source: cron`` row resolves to the topic its job delivers to (``_cron_delivery_topics``), so a briefing is one session shown under its topic and under the Cron platform listing, never a copy.
     """
@@ -456,6 +544,12 @@ async def get_threads(
             **scope,
         )
         matched = resolve_rows(rows)
+        # The search runs on the resolved set and BEFORE pagination, exactly like
+        # the topic filter: a client that filtered the page it happens to hold
+        # would miss every match past the first page and misreport the total.
+        needle = " ".join((q or "").split())
+        if needle:
+            matched = _search_matched(db, matched, needle)
         total = len(matched)
         threads = matched[offset : offset + limit]
     finally:

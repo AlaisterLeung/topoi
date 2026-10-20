@@ -464,6 +464,77 @@ def main() -> int:
         moved,
     )
 
+    # ---- search: one topic's threads, transcript first -------------------------
+    # The topic tab's search box rides ``q``. The transcript leg is the store's
+    # FTS index, so a thread is found by what was SAID in it and not only by its
+    # title; that index is global, so scoping it to the listed set is this
+    # handler's job - a hit for another topic must never leak through.
+    search_db = SessionDB()
+    try:
+        search_db.create_session("sess_search", "local", chat_id="")
+        search_db.append_message(
+            "sess_search", "user", "a note about the fusion reactor shutdown"
+        )
+        search_db.create_session("sess_search2", "local", chat_id="")
+        search_db.append_message(
+            "sess_search2", "assistant", "the reactor crew roster for next month"
+        )
+        search_db.create_session("sess_quiet", "local", chat_id="")
+        search_db.append_message("sess_quiet", "user", "nothing to see here")
+        # A title match with no message behind it: the title leg has to stand on
+        # its own, or a thread whose name says it would be unfindable.
+        search_db.set_session_title("sess_quiet", "Spare parts inventory")
+    finally:
+        search_db.close()
+    for session_id in ("sess_search", "sess_search2", "sess_quiet"):
+        asyncio.run(api.bind_thread({"session_id": session_id, "topic_id": "t_empty"}))
+
+    hits = asyncio.run(api.get_threads("t_empty", 5, 0, None, "reactor"))
+    check(
+        "a search finds threads by what was said in them",
+        hits["total"] == 2
+        and {row["lineage_root"] for row in hits["threads"]}
+        == {"sess_search", "sess_search2"},
+        hits,
+    )
+    check(
+        "a transcript hit carries its matched line for the row",
+        any("reactor" in str(row.get("match") or "") for row in hits["threads"]),
+        hits["threads"],
+    )
+    scoped = asyncio.run(api.get_threads("t_news", 5, 0, None, "reactor"))
+    check(
+        "a search is scoped to the topic it is asked for",
+        scoped["total"] == 0 and scoped["threads"] == [],
+        scoped,
+    )
+    titled = asyncio.run(api.get_threads("t_empty", 5, 0, None, "inventory"))
+    check(
+        "a search matches a thread's title",
+        titled["total"] == 1 and titled["threads"][0]["lineage_root"] == "sess_quiet",
+        titled,
+    )
+    paged_hits = asyncio.run(api.get_threads("t_empty", 1, 0, None, "reactor"))
+    check(
+        "a search paginates against its own matches",
+        len(paged_hits["threads"]) == 1 and paged_hits["total"] == 2,
+        paged_hits,
+    )
+    nomatch = asyncio.run(api.get_threads("t_empty", 5, 0, None, "zzzqqq"))
+    check(
+        "a search with no match lists nothing",
+        nomatch["total"] == 0 and nomatch["threads"] == [],
+        nomatch,
+    )
+    plain = asyncio.run(api.get_threads("t_empty", 50, 0, None))
+    plain_roots = {row["lineage_root"] for row in plain["threads"]}
+    check(
+        "the listing without a query still carries every thread of the topic",
+        plain["total"] == len(plain["threads"])
+        and {"sess_search", "sess_search2", "sess_quiet"} <= plain_roots,
+        plain,
+    )
+
     print()
     if failures:
         print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
