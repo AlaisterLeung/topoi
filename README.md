@@ -1,10 +1,16 @@
-# Topoi - groups your Hermes Agent chats into topics
+# Topoi. - groups your Hermes Agent chats into topics
 
-It is a plugin that extends the gateway, desktop app, and web dashboard, working inside your normal Hermes setup. Every chat is easy to find and organized by topic in the desktop app. Cron job results arrive as topic threads you can reply to.
+Topoi groups every Hermes Agent chat under different topics in Hermes Desktop, so your conversations are easy to find again.
 
-- **On the gateway:** it keeps the list of topics and puts each chat under one.
-- **In Hermes Desktop:** it adds a Topics pane to the sidebar.
-- **In web dashboard:** it adds a Topics management tab.
+## Features
+
+- Sessions are grouped by topic as threads
+- View threads and create new ones from the sidebar
+- Deliver cron job results to topics without a separate messaging platform
+- Reply to cron job threads with continuable session context
+- Add existing sessions to a topic and move threads to a different one
+- Create and manage topics in both Desktop and Web Dashboard
+- Continue your chats on the go with [Topoi mobile app](https://github.com/AlaisterLeung/topoi-mobile)
 
 ## Install
 
@@ -13,6 +19,19 @@ It is a plugin that extends the gateway, desktop app, and web dashboard, working
 3. Enable the plugin for both Desktop and Agent.
 4. Restart gateway.
 5. Start chatting by creating topics and chatting in new threads!
+
+## Upgrading
+
+1. Open the plugins page in Hermes Desktop: `Capabilities` > `Plugins`
+2. Click the `Update` button for Topoi.
+
+**If your Hermes Desktop connects to a remote gateway,** it only upgrades the gateway side. On the computer running Hermes Desktop, download the desktop-side update yourself, then reload (`Ctrl+K` / `⌘ K` → `Reload desktop plugins`) or restart the app.
+
+```bash
+mkdir -p ~/.hermes/plugins/topoi/desktop
+curl -fsSL https://raw.githubusercontent.com/AlaisterLeung/topoi/main/desktop/plugin.js \
+    -o ~/.hermes/plugins/topoi/desktop/plugin.js
+```
 
 ## Project Architecture
 
