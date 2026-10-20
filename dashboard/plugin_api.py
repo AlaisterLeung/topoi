@@ -6,7 +6,7 @@ Routes (CONTRACT.md section 3):
 
 - ``GET /topics`` - the registry: entries, order, home. Bindings are server-side only and never shipped as a map.
 - ``PUT /topics`` - store a client-sent registry; 422 with the refusal reason on a bad one.
-- ``GET /threads`` - session rows resolved to topics, paged, newest first; only threads filed under a live topic are listed.
+- ``GET /threads`` - session rows resolved to topics (adapter-minted ``chat_id``, then the binding store, then a cron run's own job delivery lane), paged, newest first; only threads filed under a live topic are listed.
 - ``POST /threads/bind`` - file one session under a topic, or move one that is already filed (the desktop half's thread-creation flow and the row menu's Move to topic).
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
 
@@ -63,15 +63,30 @@ topic_store = _load_sibling("topic_store")
 bindings = _load_sibling("bindings")
 
 
-def _topic_id_of(row: dict[str, Any], binding_map: dict[str, str]) -> str | None:
+def _topic_id_of(
+    row: dict[str, Any],
+    binding_map: dict[str, str],
+    cron_topics: dict[str, str],
+) -> str | None:
     """The topic a session row belongs to.
 
     A ``source: topoi`` session carries its topic in ``chat_id`` (the adapter mints those for cron deliveries); every other session resolves through the binding map, keyed by lineage root. Listing rows are already projected to their live tip (``_lineage_root_id`` carries the durable id, same field the desktop's session-row slots hand out), so the root - not the row id - is the binding key.
+
+    A ``source: cron`` row is a scheduled RUN (``cron_<job id>_<stamp>``): its topic lives on the job's delivery lane, never on the row, so it resolves through ``cron_topics``. A client-filed binding still wins for these rows, which is what makes Move to topic stick on a briefing. The order matters: chat_id (adapter-minted) > file (a human decision) > delivery lane (the job's own target).
     """
-    if str(row.get("source") or "") == "topoi":
+    source = str(row.get("source") or "")
+    if source == "topoi":
         chat_id = str(row.get("chat_id") or "").strip()
         return chat_id if topic_store.is_topic_id(chat_id) else None
-    return binding_map.get(str(row.get("_lineage_root_id") or row.get("id") or ""))
+    root = str(row.get("_lineage_root_id") or row.get("id") or "")
+    filed = binding_map.get(root)
+    if filed:
+        return filed
+    if source == "cron":
+        job_id = _cron_job_id(root, cron_topics)
+        if job_id:
+            return cron_topics[job_id]
+    return None
 
 
 def _is_compression_edge(child: dict[str, Any], parent: dict[str, Any]) -> bool:
@@ -113,6 +128,90 @@ def _open_db(profile: str | None):
     from hermes_cli.web_server_sessions import _open_session_db_for_profile
 
     return _open_session_db_for_profile(profile or None, read_only=True)
+
+
+# A cron run session is minted by the scheduler as `cron_<job id>_<stamp>`; the id
+# prefix is the only link back to the job, and the job's delivery lane is the only
+# record of where the run went.
+_CRON_SESSION_PREFIX = "cron_"
+
+
+def _deliver_text(value: Any) -> str:
+    """One delivery-lane value as the core reads it: lists flatten to a comma string, empty means local."""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(part).strip() for part in value if str(part).strip())
+    return str(value or "")
+
+
+def _lane_topic(value: Any, home_topic: str) -> str | None:
+    """The topoi topic one delivery-lane value addresses, or None when it has no topoi leg.
+
+    Mirrors the core's grammar (``cron/scheduler_delivery.py::_resolve_delivery_targets``): comma-separated tokens, ``<platform>:<target>``. ``topoi:<topic>[:<thread>]`` names one (the thread suffix is the continuable-run key, not a topic); a bare ``topoi`` is the home topic, the same one the adapter's ``send()`` falls back to. The ``all`` routing token is deliberately not expanded: it means every platform with a home, so honouring it would file every broadcast job's runs under the home topic.
+    """
+    for token in _deliver_text(value).split(","):
+        platform, _, target = token.strip().partition(":")
+        if platform.strip().lower() != PLATFORM_NAME:
+            continue
+        named = target.strip()
+        if not named:
+            return home_topic or None
+        topic = named.split(":")[0].strip()
+        if topic_store.is_topic_id(topic):
+            return topic
+    return None
+
+
+def _cron_delivery_topics(profile: str | None) -> dict[str, str]:
+    """Job id -> the topic that job's runs are filed under.
+
+    Read from the profile's cron job store on every listing (no cache): the job is the record, so a run always resolves against the job as it stands. A job that delivers nowhere topoi-shaped is absent, and so is a job whose delivery lane names no topic this registry knows - the caller's live-topic filter then drops those runs, exactly like any other unfiled session. ``failure_deliver`` is the fallback lane the core itself uses for a failed run's notice.
+
+    An unreadable job store is a debug log and no filing: a listing must never fail because cron state is mid-repair.
+    """
+    try:
+        from cron import jobs as cron_jobs
+
+        if profile:
+            # A dashboard process serves every profile; the store scope is an execution-context
+            # override, so this cannot retarget a concurrent tick of another profile.
+            from hermes_cli.web_server_cron import _cron_profile_home, _cron_store_scope
+
+            _name, home = _cron_profile_home(profile)
+            with _cron_store_scope(home):
+                jobs = cron_jobs.load_jobs()
+        else:
+            jobs = cron_jobs.load_jobs()
+    except Exception:  # a listing must never fail on cron state
+        logger.debug("[topoi] cron job store unreadable; no run filing", exc_info=True)
+        return {}
+    home_topic = topic_store.home_id()
+    topics: dict[str, str] = {}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get("id") or "").strip()
+        if not job_id:
+            continue
+        topic = _lane_topic(job.get("deliver"), home_topic) or _lane_topic(
+            job.get("failure_deliver"), home_topic
+        )
+        if topic:
+            topics[job_id] = topic
+    return topics
+
+
+def _cron_job_id(session_id: str, cron_topics: dict[str, str]) -> str | None:
+    """The job a ``cron_<job id>_<stamp>`` session belongs to, or None.
+
+    Matched against the known job ids rather than parsed out of the id: the stamp's shape is the scheduler's business, and a prefix test against the ids that actually exist cannot drift from it. The trailing underscore keeps ``abc`` from matching ``abcdef``.
+    """
+    session = str(session_id or "")
+    if not session.startswith(_CRON_SESSION_PREFIX):
+        return None
+    for job_id in cron_topics:
+        if session.startswith(f"{_CRON_SESSION_PREFIX}{job_id}_"):
+            return job_id
+    return None
 
 
 def _broadcast(payload: dict[str, Any] | None = None) -> None:
@@ -280,6 +379,8 @@ async def get_threads(
     """Session rows resolved to topics, newest activity first, and only those filed under a live topic.
 
     Each row: ``session_id`` (the live chain tip a client opens), ``lineage_root`` (the durable id bindings key on), ``topic_id`` (always a live registry entry, never null), plus title, ``latest_message`` (the newest user or assistant text, collapsed to one line and capped, read per listed row), and the activity fields. A session with no topic never appears, and neither does a thread whose topic is no longer a live entry (a deleted topic, including a ``source: topoi`` session whose delivery topic is gone): the filter runs before pagination, so ``total`` counts the listed set and ``offset`` walks it. Archived, hidden and machinery-source sessions are excluded, mirroring the dashboard's own listing. ``topic`` filters to one topic; pass no ``topic`` to list every topic's threads.
+
+    Scheduled runs are listed here too: a ``source: cron`` row resolves to the topic its job delivers to (``_cron_delivery_topics``), so a briefing is one session shown under its topic and under the Cron platform listing, never a copy.
     """
     scope = {
         "exclude_sources": list(_HIDDEN_SOURCES),
@@ -293,13 +394,20 @@ async def get_threads(
         binding_map = bindings.mapping()
 
         def resolve_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            # The delivery lanes are read only when the window carries a run: most listings
+            # hold none, and a job-store read per refetch would be pure overhead.
+            cron_topics = (
+                _cron_delivery_topics(profile)
+                if any(str(row.get("source") or "") == "cron" for row in rows)
+                else {}
+            )
             out = []
             for row in rows:
                 # The listing projects a compression root onto its live tip and carries the
                 # durable id in _lineage_root_id; a row with no rotation is its own root.
                 root = str(row.get("_lineage_root_id") or row.get("id") or "")
                 tip = str(row.get("id") or root)
-                topic_id = _topic_id_of(row, binding_map)
+                topic_id = _topic_id_of(row, binding_map, cron_topics)
                 # A thread outside every live topic is nobody's listing: untagged rows
                 # and rows under a deleted topic both drop here, before pagination.
                 if topic_id not in live:

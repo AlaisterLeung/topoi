@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import pathlib
 import sys
@@ -297,6 +298,170 @@ def main() -> int:
         "deleting an unknown session is a no-op success",
         bool(absent.get("ok")),
         absent,
+    )
+
+    # ---- scheduled runs file under their job's delivery topic -------------------
+    # A cron run is its own session (cron_<job id>_<stamp>, source='cron', no chat_id);
+    # the topic lives on the JOB's delivery lane. The run must be listed under that
+    # topic as the SAME session, so a client that opens the row opens the run itself.
+    cron_dir = home / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    (cron_dir / "jobs.json").write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-10-20T09:00:00+08:00",
+                "jobs": [
+                    {
+                        "id": "aaaa11112222",
+                        "name": "Explicit",
+                        "deliver": "topoi:t_news",
+                    },
+                    {"id": "bbbb33334444", "name": "Bare home", "deliver": "topoi"},
+                    {
+                        "id": "cccc55556666",
+                        "name": "Dead topic",
+                        "deliver": "topoi:t_deleted",
+                    },
+                    {"id": "dddd77778888", "name": "Local only", "deliver": "local"},
+                    {
+                        "id": "eeee99990000",
+                        "name": "Multi target",
+                        "deliver": "telegram:123,topoi:t_empty",
+                    },
+                    {
+                        "id": "ffff00001111",
+                        "name": "Failure lane",
+                        "deliver": "local",
+                        "failure_deliver": "topoi:t_news",
+                    },
+                    {
+                        "id": "1234abcd5678",
+                        "name": "List form",
+                        "deliver": ["local", "topoi:t_news"],
+                    },
+                    {
+                        "id": "5678abcd1234",
+                        "name": "Thread suffix",
+                        "deliver": "topoi:t_test:th_1700000000_abc123",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_db = SessionDB()
+    try:
+        for job_id in (
+            "aaaa11112222",
+            "bbbb33334444",
+            "cccc55556666",
+            "dddd77778888",
+            "eeee99990000",
+            "ffff00001111",
+            "1234abcd5678",
+            "5678abcd1234",
+        ):
+            run_db.create_session(f"cron_{job_id}_20261020_090000", "cron", chat_id="")
+        # A run of a job the store no longer knows: nothing to resolve, so no row.
+        run_db.create_session("cron_deadbeef9999_20261020_090000", "cron", chat_id="")
+        # A compressed run: the parent ends first, the continuation becomes the tip.
+        # The job id rides the ROOT, so the projection is what keeps the run filed.
+        run_db.end_session("cron_1234abcd5678_20261020_090000", "compression")
+        run_db.create_session(
+            "20261020_091500_comp01",
+            "cron",
+            chat_id="",
+            parent_session_id="cron_1234abcd5678_20261020_090000",
+        )
+    finally:
+        run_db.close()
+
+    runs = asyncio.run(api.get_threads(None, 500, 0, None))
+    filed = {row["lineage_root"]: row for row in runs["threads"]}
+    check(
+        "a scheduled run is listed under its job's delivery topic",
+        filed.get("cron_aaaa11112222_20261020_090000", {}).get("topic_id") == "t_news",
+        filed.get("cron_aaaa11112222_20261020_090000"),
+    )
+    check(
+        "a run is listed as the run's own session, not a copy",
+        filed.get("cron_aaaa11112222_20261020_090000", {}).get("session_id")
+        == "cron_aaaa11112222_20261020_090000",
+        filed.get("cron_aaaa11112222_20261020_090000"),
+    )
+    check(
+        "a bare deliver=topoi run files under the home topic",
+        filed.get("cron_bbbb33334444_20261020_090000", {}).get("topic_id") == "t_test",
+        filed.get("cron_bbbb33334444_20261020_090000"),
+    )
+    check(
+        "a run whose delivery topic is not a live entry is not listed",
+        "cron_cccc55556666_20261020_090000" not in filed,
+        runs["threads"],
+    )
+    check(
+        "a local-only job's run is not listed",
+        "cron_dddd77778888_20261020_090000" not in filed,
+        runs["threads"],
+    )
+    check(
+        "a run of a job the store no longer knows is not listed",
+        "cron_deadbeef9999_20261020_090000" not in filed,
+        runs["threads"],
+    )
+    check(
+        "a topoi leg in a comma-separated deliver value resolves",
+        filed.get("cron_eeee99990000_20261020_090000", {}).get("topic_id") == "t_empty",
+        filed.get("cron_eeee99990000_20261020_090000"),
+    )
+    check(
+        "a list-shaped deliver value resolves",
+        filed.get("cron_1234abcd5678_20261020_090000", {}).get("topic_id") == "t_news",
+        filed.get("cron_1234abcd5678_20261020_090000"),
+    )
+    check(
+        "the failure lane files a run whose deliver points nowhere",
+        filed.get("cron_ffff00001111_20261020_090000", {}).get("topic_id") == "t_news",
+        filed.get("cron_ffff00001111_20261020_090000"),
+    )
+    check(
+        "a thread-suffixed target resolves to its topic",
+        filed.get("cron_5678abcd1234_20261020_090000", {}).get("topic_id") == "t_test",
+        filed.get("cron_5678abcd1234_20261020_090000"),
+    )
+    check(
+        "a compressed run resolves through its lineage root at the live tip",
+        filed.get("cron_1234abcd5678_20261020_090000", {}).get("session_id")
+        == "20261020_091500_comp01",
+        [
+            row
+            for row in runs["threads"]
+            if row["session_id"] == "20261020_091500_comp01"
+        ],
+    )
+    filtered_runs = asyncio.run(api.get_threads("t_news", 50, 0, None))
+    check(
+        "the topic filter counts the runs filed under it",
+        {row["lineage_root"] for row in filtered_runs["threads"]}
+        >= {
+            "cron_aaaa11112222_20261020_090000",
+            "cron_ffff00001111_20261020_090000",
+            "cron_1234abcd5678_20261020_090000",
+        },
+        filtered_runs,
+    )
+    # A human filing beats the job's own lane: Move to topic on a briefing sticks.
+    asyncio.run(
+        api.bind_thread(
+            {"session_id": "cron_bbbb33334444_20261020_090000", "topic_id": "t_news"}
+        )
+    )
+    moved = asyncio.run(api.get_threads("t_news", 50, 0, None))
+    check(
+        "a binding on a run wins over the job's delivery lane",
+        "cron_bbbb33334444_20261020_090000"
+        in {row["lineage_root"] for row in moved["threads"]},
+        moved,
     )
 
     print()

@@ -1,8 +1,17 @@
 # Topoi contract
 
-This document is the contract between the gateway side of this package and every client of it: the identifiers it uses, the configuration keys it owns, the REST surface it serves, the cron delivery contract, the events it emits, and how the desktop half is installed. This repo holds the canonical copy; a client that speaks the surface should vendor a pinned copy of this file alongside its code.
+This is the contract between the gateway side of this package and every client of it. It covers the identifiers, the configuration keys, the REST surface, the cron delivery contract, the events, and the desktop half install. This repo holds the canonical copy, and a client that speaks the surface should vendor a pinned copy of this file alongside its code.
 
-There is no inbound transport and no protocol of our own. The gateway side is a delivery namespace: cron results and framework notices land in topic-keyed sessions, and a continuable run gets a fresh reply-able thread. On top of that, the gateway side serves the topic registry and topic-grouped session listings over REST. The desktop half (the Hermes Desktop plugin at `desktop/plugin.js`) is the primary client and the dashboard extension is a second one, but anything that can reach `/api/plugins/topoi/` can read and write the same state.
+There is no inbound transport and no protocol of our own. The gateway side is a delivery namespace: cron results and framework notices land in topic-keyed sessions, and a continuable run gets a fresh reply-able thread. The gateway side also serves the topic registry and topic-grouped session listings over REST. The desktop half (the Hermes Desktop plugin at `desktop/plugin.js`) is the primary client and the dashboard extension is a second one, but anything that can reach `/api/plugins/topoi/` can read and write the same state.
+
+## Contents
+
+1. [Identifiers](#1-identifiers)
+2. [Configuration](#2-configuration)
+3. [REST surface](#3-rest-surface)
+4. [Delivery contract](#4-delivery-contract)
+5. [Events](#5-events)
+6. [Desktop half install](#6-desktop-half-install)
 
 ## 1. Identifiers
 
@@ -33,11 +42,11 @@ platforms:
       name: System
 ```
 
-`home_channel` is the only configured-home key: it seeds the home when no registry is stored yet, and the registry rewrites it whenever `home_id` moves, so the delivery home a bare `deliver=topoi` targets never drifts from the home the app shows.
+`home_channel` is the only configured-home key. It seeds the home when no registry is stored yet, and the registry rewrites it whenever `home_id` moves, so the delivery home a bare `deliver=topoi` targets never drifts from the home the app shows.
 
-A registry write moves both keys (`topics.home_id`, `home_channel`) in the same read-modify-write, so a fresh process and a fresh `load_gateway_config()` always see the moved home. The in-process views are synced by the same write path: `TopoiAdapter.sync_live_home()` repoints the runner's `PlatformConfig.home_channel` (framework notices and the system prompt's delivery list), which is a startup snapshot that never reloads mid-process. Cron needs no help there: it resolves through a fresh config load on every delivery.
+A registry write moves both keys (`topics.home_id`, `home_channel`) in the same read-modify-write, so a fresh process and a fresh `load_gateway_config()` always see the moved home. The same write path syncs the in-process views: `TopoiAdapter.sync_live_home()` repoints the runner's `PlatformConfig.home_channel`, which is a startup snapshot that never reloads mid-process and feeds framework notices and the system prompt's delivery list. Cron needs no help there: it resolves through a fresh config load on every delivery.
 
-Because `home_channel` is the only thing that feeds the typed projection, a config that lost the key (hand edit, or one never written) would silently break `deliver=topoi` — the platform still looks connected, since the registry alone satisfies `is_connected`, and nothing raises. The adapter's `connect()` therefore calls `repair_home_projection()`, which rewrites the projection from the stored registry when it is missing or stale; a healthy config costs one cached read and no write.
+Because `home_channel` is the only thing that feeds the typed projection, a config that lost the key (hand edit, or one never written) would silently break `deliver=topoi`. The platform still looks connected, since the registry alone satisfies `is_connected`, and nothing raises. The adapter's `connect()` therefore calls `repair_home_projection()`, which rewrites the projection from the stored registry when it is missing or stale; a healthy config costs one cached read and no write.
 
 ### 2.1 The registry block
 
@@ -45,7 +54,14 @@ The registry block is the only home for topic state: topics are low-churn (a ren
 
 ### 2.2 Bindings
 
-Session-to-topic bindings do NOT live in the config block. They are high-churn, session-scoped and unbounded, so they live in a plugin-private SQLite store at `<hermes home>/plugin-data/topoi/bindings.db`, and clients never see the map: the REST layer resolves a thread's topic server-side on every `GET /threads`. A binding maps a session's lineage root (the durable id that survives compression) to a topic. A session the adapter itself minted (one with `source: topoi`) carries its topic in `chat_id` and never consults the store. The only write path is `POST /threads/bind`, when a client files a freshly created chat under a topic; there is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path. A legacy config-level `bindings` block (left by an earlier build) is ignored on read, adopted into the store once on the first `GET /topics`, and dropped by the next registry write.
+Session-to-topic bindings do NOT live in the config block. They are high-churn, session-scoped and unbounded, so they live in a plugin-private SQLite store at `<hermes home>/plugin-data/topoi/bindings.db`. Clients never see the map: the REST layer resolves a thread's topic server-side on every `GET /threads`. A binding maps a session's lineage root (the durable id that survives compression) to a topic.
+
+A session's topic is resolved as follows:
+- A session the adapter itself minted (`source: topoi`) carries its topic in `chat_id` and never consults the store.
+- A scheduled run (`source: cron`) resolves from its job's delivery lane, a read of the job store rather than a binding.
+- Every other session resolves through the store, keyed by lineage root.
+
+The only write path is `POST /threads/bind`: a client files a freshly created chat under a topic, or moves a listed thread (a scheduled run included) to another one. There is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path. A legacy config-level `bindings` block (left by an earlier build) is ignored on read, adopted into the store once on the first `GET /topics`, and dropped by the next registry write.
 
 An older block may still use the retired `items` / `revision` spellings; they are ignored, never half-read.
 
@@ -55,7 +71,7 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 
 ### 3.1 `GET /topics`
 
-`GET /topics` returns the registry: `updated_at`, `home_id`, and `entries` in order. Bindings are server-side only and are never shipped as a map. Deleted topics are not tracked anywhere: only a topic with no threads can be deleted (both clients offer delete only for a 0-thread topic), so there is no tombstone list, a leftover `deleted` key in the block is ignored on read, and the next registry write drops it from the file.
+`GET /topics` returns the registry: `updated_at`, `home_id`, and `entries` in order. Bindings are server-side only and are never shipped as a map. Deleted topics are not tracked anywhere. Only a topic with no threads can be deleted (both clients offer delete only for a 0-thread topic), so there is no tombstone list. A leftover `deleted` key in the block is ignored on read, and the next registry write drops it from the file.
 
 ### 3.2 `PUT /topics`
 
@@ -72,7 +88,12 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 
 `latest_message` is the newest user or assistant text of the thread, whitespace-collapsed to one line and capped at a row-preview width, so a client can render two-line rows without a second call. It is deliberately not the store's own `preview` column: that one is the session's opening user prompt, which answers a title lookup but never the "what happened last" a listing row shows. Tool rows are skipped and the read pages back from the newest row, so the field costs one bounded read per listed row.
 
-A `source: topoi` session resolves its topic from `chat_id` (the adapter mints those for cron deliveries) and never consults the binding store; every other session resolves through the store, keyed by lineage root. Archived, hidden and machinery-source sessions (`kanban`, `tool`) are excluded, mirroring the dashboard's own listing. Query params: `topic` (filter to one), `limit` (1-500, default 200), `offset`, `profile` (defaults to this process's own store). The live-topic filter runs before pagination, so `total` is the filtered count and `offset` walks the filtered rows: a match sitting past the first page is still reachable.
+How each listed row resolves its topic:
+- A `source: topoi` session resolves its topic from `chat_id` (the adapter mints those for cron deliveries) and never consults the binding store.
+- A scheduled run is listed here too: a `source: cron` row (`cron_<job id>_<stamp>`, the session the Cron platform listing shows) resolves to the topic its job's `deliver` lane addresses, `topoi:<topic>` or the home topic for a bare `topoi`, with `failure_deliver` as the fallback. One briefing is one session shown under its topic and under Cron, never a copy.
+- Every other session resolves through the store, keyed by lineage root.
+
+Nothing is stored for the cron resolution; the job store is the record. That is why a job whose `deliver` is retargeted moves its older runs with it, a run of a deleted job drops out of its topic (the session itself stays under Cron), and a client-filed binding still wins, so Move to topic sticks. Archived, hidden and machinery-source sessions (`kanban`, `tool`) are excluded, mirroring the dashboard's own listing. Query params: `topic` (filter to one), `limit` (1-500, default 200), `offset`, `profile` (defaults to this process's own store). The live-topic filter runs before pagination, so `total` is the filtered count and `offset` walks the filtered rows: a match sitting past the first page is still reachable.
 
 ### 3.4 `POST /threads/bind`
 
@@ -90,7 +111,7 @@ Every registry write broadcasts `plugin.topoi.topics.changed`. Bindings need no 
 
 ### 3.7 The dashboard client
 
-The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (4), and its heading total counts exactly those threads; a thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
+The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (4), and its heading total counts exactly those threads. A thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
 
 ## 4. Delivery contract
 
@@ -100,7 +121,7 @@ The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) 
 
 ### 4.2 Continuable runs
 
-A continuable job (per-job `attach_to_session: true`, or global `cron.mirror_delivery: true`) with a live gateway and the platform enabled: core mints a thread via `create_handoff_thread`, seeds the topic-keyed session, delivers the output through `send()`, and mirrors the brief into the seeded session as a labelled user turn. Replies continue in the same session.
+For a continuable job (per-job `attach_to_session: true`, or global `cron.mirror_delivery: true`) with a live gateway and the platform enabled, core mints a thread via `create_handoff_thread`, seeds the topic-keyed session, delivers the output through `send()`, and mirrors the brief into the seeded session as a labelled user turn. Replies continue in the same session.
 
 ### 4.3 Standalone runs
 
@@ -118,8 +139,8 @@ Cron preflight requires the target platform to be known and to have gateway cred
 
 ### 6.1 Same machine as the gateway
 
-Desktop plugins are app-level: one root per machine, `$HERMES_HOME/desktop-plugins/`. When a unified package like this one lands in a local plugins root, the app copies its `desktop/plugin.js` there, refreshed when the source file changes (mtime rule, via Rescan or a restart; the copy is what loads and hot-reloads). The desktop half is enabled by default and can be toggled in Capabilities to Plugins.
+Desktop plugins are app-level: one root per machine, `$HERMES_HOME/desktop-plugins/`. When a unified package like this one lands in a local plugins root, the app copies its `desktop/plugin.js` there and refreshes the copy when the source file changes (mtime rule, via Rescan or a restart). The copy is what loads and hot-reloads. The desktop half is enabled by default and can be toggled in Capabilities to Plugins.
 
 ### 6.2 Remote backend
 
-Against a remote backend (the gateway on another machine), the backend's `~/.hermes/plugins` is not reachable as a filesystem: install the package on the backend machine for the gateway side, and on the app machine via Install from Git with the Desktop target, or by cloning the desktop half separately into `desktop-plugins/`. The gateway side stays off until `platforms.topoi.enabled` is set.
+Against a remote backend (the gateway on another machine), the backend's `~/.hermes/plugins` is not reachable as a filesystem. Install the package on the backend machine for the gateway side, and on the app machine via Install from Git with the Desktop target, or by cloning the desktop half separately into `desktop-plugins/`. The gateway side stays off until `platforms.topoi.enabled` is set.
