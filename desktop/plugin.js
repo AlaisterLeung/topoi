@@ -38,6 +38,7 @@ import {
   Input,
   PANES_AREA,
   ScrollArea,
+  MessageTextContent,
   queryClient,
   coarseElapsed,
   useQuery,
@@ -98,6 +99,19 @@ const CSS = `
 .topoi-row-main{display:flex;min-width:0;align-items:center;gap:6px;height:26px;padding:0 4px;text-align:left;border:0;border-radius:4px;background:none;color:var(--ui-text-primary);cursor:pointer}
 .topoi-row-main:hover{background:var(--chrome-action-hover)}
 .topoi-row-main.topoi-open,.topoi-row-main.topoi-open:hover{background:var(--ui-row-active-background)}
+.topoi-reader{display:flex;flex-direction:column;height:100%;min-height:0}
+.topoi-reader-head{display:flex;width:min(86%,44rem);margin:0 auto;align-items:center;gap:8px;padding:10px 8px 4px}
+.topoi-reader-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.875rem;font-weight:600;color:var(--ui-text-primary)}
+.topoi-reader-when{flex-shrink:0;font-size:0.625rem;color:var(--ui-text-quaternary)}
+.topoi-reader-body{flex:1;min-height:0;overflow:auto}
+.topoi-reader-markdown{width:min(86%,44rem);margin:0 auto;padding:12px 8px 40px}
+.topoi-reader-markdown .aui-md > :first-child{margin-top:0}
+.topoi-reader-markdown .aui-md > :last-child{margin-bottom:0}
+.topoi-reader-markdown .aui-md :where(p){margin-block:0.7rem 0}
+.topoi-reader-markdown .aui-md :where(h1,h2,h3,h4){margin-block:1rem 0.25rem}
+.topoi-reader-markdown .aui-md [data-slot='aui_markdown-image'] :where(img){margin:0}
+.topoi-reader-note{width:min(86%,44rem);margin:0 auto;padding:12px 8px 40px;font-size:0.75rem;color:var(--ui-text-tertiary)}
+.topoi-reader-reply{color:var(--theme-neutral-chrome)}
 .topoi-row-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.75rem}
 .topoi-row-time{flex-shrink:0;font-size:0.625rem;color:var(--ui-text-quaternary)}
 .topoi-dot{flex-shrink:0;box-sizing:border-box;width:6px;height:6px;border-radius:9999px}
@@ -151,6 +165,13 @@ let storage = null;
 
 // The topic tabs this plugin has open, keyed by topic id: closed on unload.
 const topicTabs = new Map();
+// The cron readers this plugin has open, keyed by session id: a second click
+// fronts the same tab instead of stacking a duplicate.
+const cronReaders = new Map();
+// The cron result being read, by row session id, or null. The sidebar row
+// reads it to keep its active highlight: a cron row opens a workspace tab, so
+// core's own active session never moves and cannot drive the pane's selection.
+const $cronReaderId = atom(null);
 // The armed New thread filing, if any: the topic to file under plus the chat
 // id that was focused when the click happened (never the one we want). An
 // atom so the composer banner re-renders when the arm changes.
@@ -228,24 +249,66 @@ const bindThread = (sessionId, topicId, move = false) =>
       ? { session_id: sessionId, topic_id: topicId, move: true }
       : { session_id: sessionId, topic_id: topicId },
   });
+const fetchCronResult = (sessionId) =>
+  rest(`/threads/${encodeURIComponent(sessionId)}/cron`);
 const deleteThread = (sessionId) =>
   rest(`/threads/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 
 // The row's open door: a new tab / window / main on intent (the same
 // vocabulary middle-click and the session menu use). The sidebar pane always
 // passes "tab", so a row click never replaces the chat already open.
-const openThread = (sessionId, intent) =>
-  host
+const openThread = (thread, intent) => {
+  if (thread && typeof thread === "object" && thread.cron_result) {
+    openCronReader(thread);
+    return;
+  }
+  const sessionId =
+    typeof thread === "string" ? thread : thread?.session_id;
+  if (!sessionId) return;
+  return host
     .openSession(sessionId, intent ? { intent } : {})
     .catch((error) => host.notifyError(error, "Could not open the thread"));
+};
+
+// A cron result opens as a document, not as a chat: a run's transcript is tool
+// calls, and a mirrored thread is a single seeded turn. One tab per session,
+// fronted on a second click, and the row's active highlight follows it because
+// core's focused session never moves for a workspace tab.
+function openCronReader(thread) {
+  const sessionId = thread?.session_id;
+  if (!sessionId || !rest) return;
+  if (typeof host.openWorkspace !== "function") {
+    host.notify({
+      kind: "error",
+      message: "Update Hermes Desktop to open a cron result.",
+    });
+    return;
+  }
+  const close = host.openWorkspace(`cron-${sessionId}`, {
+    dock: { pane: "workspace", pos: "center" },
+    onClose: () => {
+      cronReaders.delete(sessionId);
+      if ($cronReaderId.get() === sessionId) $cronReaderId.set(null);
+    },
+    render: () => jsx(CronReader, { thread }),
+    title: thread.title || "Cron result",
+  });
+  cronReaders.set(sessionId, close);
+  $cronReaderId.set(sessionId);
+}
 
 // Opening a thread from its TOPIC TAB replaces the tab: the session opens as
 // a tab in the same strip and the topic tab closes, so the workspace never
 // carries both the list and the chat. A failed open leaves the tab standing
 // rather than costing the listing.
-async function openThreadFromTopicTab(sessionId, topicId) {
+async function openThreadFromTopicTab(thread, topicId) {
+  if (thread?.cron_result) {
+    // The reader is a sibling of the list, not a replacement for it.
+    openCronReader(thread);
+    return;
+  }
   try {
-    await host.openSession(sessionId, { intent: "tab" });
+    await host.openSession(thread.session_id, { intent: "tab" });
     topicTabs.get(topicId)?.();
   } catch (error) {
     host.notifyError(error, "Could not open the thread");
@@ -424,7 +487,12 @@ function TopicView({ topicId }) {
         filedIds.add(row.session_id);
         if (row.lineage_root) filedIds.add(row.lineage_root);
       }
-      return (listed?.sessions ?? []).filter((row) => row?.id && !filedIds.has(row.id));
+      // Cron runs are not chat targets. A result belongs to its topic through the
+      // reader, and filing a run by hand would list the run beside the thread it
+      // already delivered into.
+      return (listed?.sessions ?? []).filter(
+        (row) => row?.id && !filedIds.has(row.id) && row.source !== "cron",
+      );
     },
     queryKey: ["topoi", "unfiled", scope, topicId],
     staleTime: 10_000,
@@ -561,7 +629,7 @@ function TopicView({ topicId }) {
                     entries,
                     hint: thread.match,
                     key: thread.lineage_root,
-                    onOpen: (sessionId) => openThreadFromTopicTab(sessionId, topicId),
+                    onOpen: (row) => openThreadFromTopicTab(row, topicId),
                     showStatus: false,
                     thread,
                   }),
@@ -795,6 +863,84 @@ const formatAge = (seconds) => {
   return unit === "second" ? "now" : `${value}${AGE_SUFFIX[unit]}`;
 };
 
+// One cron result as a document: a mirrored run thread's brief, or a run's own
+// final answer, rendered with the same Markdown pipeline core chat uses. The
+// composer's absence is deliberate - a run is not a conversation. Reply hands
+// the seeded session to core's chat, and exists only when the backend proved
+// the mirror (a delivery row plus a live, keyed seed).
+function CronReader({ thread }) {
+  const scope = useScope();
+  const sessionId = thread?.session_id;
+  const query = useQuery({
+    enabled: Boolean(sessionId) && Boolean(rest),
+    queryFn: () => fetchCronResult(sessionId),
+    queryKey: ["topoi", "cron", scope, sessionId],
+    staleTime: 5_000,
+  });
+  const doc = query.data;
+  const when = thread?.last_active;
+  const reply = () => {
+    if (!doc?.replyable || !doc.reply_session_id) return;
+    // Core's focus moves to the seeded session, and the pane's chat case reads
+    // that focus: the reader's own highlight is spent the moment we hand off.
+    $cronReaderId.set(null);
+    host
+      .openSession(doc.reply_session_id, { intent: "tab" })
+      .catch((error) => host.notifyError(error, "Could not open the thread"));
+  };
+  return jsxs("div", {
+    className: "topoi-reader",
+    children: [
+      jsxs("div", {
+        className: "topoi-reader-head",
+        children: [
+          jsx("span", {
+            className: "topoi-reader-title",
+            children: doc?.title || thread?.title || "Cron result",
+          }),
+          doc?.replyable
+            ? jsx(Button, {
+                className: "topoi-reader-reply",
+                onClick: reply,
+                size: "sm",
+                children: [
+                  jsx(Codicon, { name: "comment-discussion", size: "0.875rem" }),
+                  "Reply",
+                ],
+              })
+            : null,
+          when
+            ? jsx("span", {
+                className: "topoi-reader-when",
+                children: formatAge(when),
+              })
+            : null,
+        ],
+      }),
+      jsx("div", {
+        className: "topoi-reader-body",
+        children: query.isLoading
+          ? jsx("div", { className: "topoi-reader-note", children: "Loading..." })
+          : query.error || !doc
+            ? jsx("div", {
+                className: "topoi-reader-note",
+                children:
+                  "This result could not be read. It may have been deleted.",
+              })
+            : doc.markdown
+              ? jsx("div", {
+                  className: "topoi-reader-markdown",
+                  children: jsx(MessageTextContent, { text: doc.markdown }),
+                })
+              : jsx("div", {
+                  className: "topoi-reader-note",
+                  children: "This result is empty.",
+                }),
+      }),
+    ],
+  });
+}
+
 // One thread row, shaped like the builtin sidebar's session row: the date
 // sits in a column that never shrinks while the title truncates against it.
 // The sidebar copy carries the app's session statuses (the open band and the
@@ -809,16 +955,24 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
   const when = seconds ? formatAge(seconds) : null;
   // A thread carries its live tip (session_id) and its lineage root; the
   // focused id and the status map can hold either, so match both.
+  // A cron result opens as a workspace tab, so core's focused session never
+  // moves: the reader atom is what keeps that row lit while it is on screen.
+  const reading = useValue($cronReaderId) === thread.session_id;
   const opened =
     showStatus &&
-    focused != null &&
-    (thread.session_id === focused || thread.lineage_root === focused);
+    (reading ||
+      (focused != null &&
+        (thread.session_id === focused || thread.lineage_root === focused)));
   const status = showStatus
     ? (statuses[thread.session_id] ?? statuses[thread.lineage_root] ?? "idle")
     : "idle";
   // The move sub's targets: every registry entry but the thread's own topic
-  // (moving to the same one is a no-op, so it is not offered).
-  const others = entries.filter((item) => item.id !== thread.topic_id);
+  // (moving to the same one is a no-op, so it is not offered). A cron result has
+  // no move to offer: its topic is the adapter-minted chat_id, and resolution
+  // returns that before any binding, so a re-file could never take effect.
+  const others = thread.cron_result
+    ? []
+    : entries.filter((item) => item.id !== thread.topic_id);
   const dot = DOT_CLASS[status]
     ? jsx("span", {
         "aria-label": DOT_LABEL[status],
@@ -836,7 +990,7 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
             asChild: true,
             children: jsxs("button", {
               className: opened ? "topoi-row-main topoi-open" : "topoi-row-main",
-              onClick: () => onOpen(thread.session_id),
+              onClick: () => onOpen(thread),
               // A search hit's matched line, on the row's own tooltip: the row
               // keeps its title-and-date shape, and the answer to "why did this
               // match?" is one hover away.
@@ -852,11 +1006,11 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
           jsxs(ContextMenuContent, {
             children: [
               jsx(ContextMenuItem, {
-                onSelect: () => openThread(thread.session_id, "tab"),
+                onSelect: () => openThread(thread, "tab"),
                 children: [jsx(Codicon, { name: "browser", size: "0.875rem" }), "Open in new tab"],
               }),
               jsx(ContextMenuItem, {
-                onSelect: () => openThread(thread.session_id, "window"),
+                onSelect: () => openThread(thread, "window"),
                 children: [
                   jsx(Codicon, { name: "link-external", size: "0.875rem" }),
                   "Open in new window",
@@ -998,7 +1152,7 @@ function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle,
           jsx(ThreadRow, {
             entries,
             key: thread.lineage_root,
-            onOpen: (sessionId) => openThread(sessionId, "tab"),
+            onOpen: (row) => openThread(row, "tab"),
             showStatus: true,
             thread,
           }),
@@ -1362,6 +1516,7 @@ export default {
     ctx.onEvent("sessions.changed", () => {
       queryClient.invalidateQueries({ queryKey: ["topoi", "threads"] });
       queryClient.invalidateQueries({ queryKey: ["topoi", "topic"] });
+      queryClient.invalidateQueries({ queryKey: ["topoi", "cron"] });
     });
 
     ctx.onDispose(watchNewThreads());
