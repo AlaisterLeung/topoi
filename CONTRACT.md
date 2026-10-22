@@ -65,6 +65,14 @@ The only write path is `POST /threads/bind`: a client files a freshly created ch
 
 An older block may still use the retired `items` / `revision` spellings; they are ignored, never half-read.
 
+### 2.3 Cron thread pairings
+
+A cron run and the run thread it delivered into never name each other: the seeded session carries a topic and a thread id but no job id, and the run session carries the job id but no thread. `cron_thread.db` (same directory, same shape as the bindings) holds that pairing: one row per confirmed delivery that carried both, `thread_id`, `topic_id`, `job_id`.
+
+The adapter writes it inside `send()`, the only place the core's route metadata hands over `job_id` and `thread_id` together (`cron/scheduler_delivery.py::_live_route_metadata`). A write that fails is logged and dropped: a missing row only means the run row keeps showing, never a lost delivery.
+
+The listing reads it to withhold a run row whose clean thread is listed (section 3.3). No stamp is stored: the seed's own session row carries `started_at`, and a run is withheld when a delivery row names its job, the seed is live under that same topic, and the seed's start falls inside the run's life (`started_at` to `ended_at`, or now for a run still open) plus a grace for the finalize that follows the send.
+
 ## 3. REST surface
 
 All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth gate. The Python half is imported only when the plugin is in `plugins.enabled`; routes of a disabled plugin are rejected at request time.
@@ -85,15 +93,18 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 - `lineage_root` - the durable id bindings key on
 - `topic_id` - a live registry entry
 - `title`, `latest_message`, `started_at`, `last_active`, `message_count`, `source`
+- `cron_result`, `cron_kind`, `replyable` - the reader flags below
 
 `latest_message` is the newest user or assistant text of the thread, whitespace-collapsed to one line and capped at a row-preview width, so a client can render two-line rows without a second call. It is deliberately not the store's own `preview` column: that one is the session's opening user prompt, which answers a title lookup but never the "what happened last" a listing row shows. Tool rows are skipped and the read pages back from the newest row, so the field costs one bounded read per listed row.
 
 How each listed row resolves its topic:
 - A `source: topoi` session resolves its topic from `chat_id` (the adapter mints those for cron deliveries) and never consults the binding store.
-- A scheduled run is listed here too: a `source: cron` row (`cron_<job id>_<stamp>`, the session the Cron platform listing shows) resolves to the topic its job's `deliver` lane addresses, `topoi:<topic>` or the home topic for a bare `topoi`, with `failure_deliver` as the fallback. One briefing is one session shown under its topic and under Cron, never a copy.
+- A scheduled run is listed here too: a `source: cron` row (`cron_<job id>_<stamp>`, the session the Cron platform listing shows) resolves to the topic its job's `deliver` lane addresses, `topoi:<topic>` or the home topic for a bare `topoi`, with `failure_deliver` as the fallback. When that run delivered into a run thread whose seeded session is listed, the run row is withheld from topics: the thin thread is the reading copy and `Cron` keeps the run as provenance. The pairing is the plugin's cron thread store (`cron_thread.db`, written by the adapter from the route metadata's `job_id` + `thread_id`), and it needs both proofs - a pairing row for the run's job and a live session for that exact topic and thread, whose own `started_at` falls inside the run's life. A run that delivered into no thread (`[SILENT]`, a failed send, a deleted or archived thread) is listed as the run row, so no result goes missing.
 - Every other session resolves through the store, keyed by lineage root.
 
-Nothing is stored for the cron resolution; the job store is the record. That is why a job whose `deliver` is retargeted moves its older runs with it, a run of a deleted job drops out of its topic (the session itself stays under Cron), and a client-filed binding still wins, so Move to topic sticks. Archived, hidden and machinery-source sessions (`kanban`, `tool`) are excluded, mirroring the dashboard's own listing. Query params: `topic` (filter to one), `limit` (1-500, default 200), `offset`, `profile` (defaults to this process's own store). The live-topic filter runs before pagination, so `total` is the filtered count and `offset` walks the filtered rows: a match sitting past the first page is still reachable.
+Nothing is stored for the cron resolution; the job store is the record. That is why a job whose `deliver` is retargeted moves its older runs with it, a run of a deleted job drops out of its topic (the session itself stays under Cron), and a client-filed binding still wins, so Move to topic sticks.
+
+A cron row is a result, not a chat, and the listing says which shape it is. `cron_result` is true for a `source: cron` row and for a `source: topoi` row whose thread has a delivery row; `cron_kind` is `run` or `thread`; `replyable` is true only for a thread whose seed is live and keyed. A `source: topoi` session with no delivery row is an app-minted chat and carries none of them, which is what keeps the New thread flow opening in the composer. A finished run that answered with core's silence sentinel (`[SILENT]`, `NO_REPLY`) is dropped from the listing entirely: it produced no result to read. The drop runs in the same pass as the withholding rule, before pagination, so `total` stays honest; an open run is never dropped, and a run that delivered anything is never silent. Archived, hidden and machinery-source sessions (`kanban`, `tool`) are excluded, mirroring the dashboard's own listing. Query params: `topic` (filter to one), `limit` (1-500, default 200), `offset`, `profile` (defaults to this process's own store). The live-topic filter runs before pagination, so `total` is the filtered count and `offset` walks the filtered rows: a match sitting past the first page is still reachable.
 
 ### 3.4 `POST /threads/bind`
 
@@ -112,6 +123,17 @@ Every registry write broadcasts `plugin.topoi.topics.changed`. Bindings need no 
 ### 3.7 The dashboard client
 
 The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (4), and its heading total counts exactly those threads. A thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
+
+### 3.8 `GET /threads/{session_id}/cron`
+
+One cron result as a document, for a client that renders it instead of opening a chat. The path is `/cron` because the run is the core component and a briefing is one kind of run.
+
+- `kind: thread` - a mirrored run thread. `markdown` is the seed's first user turn with core's delivery label stripped; the transcript long-form is the brief itself.
+- `kind: run` - a scheduled run with no mirror. `markdown` is its final assistant text, read from the transcript (never the `cron/output` copy, which delivery may have truncated).
+- `replyable` / `reply_session_id` - true only for a mirrored thread whose seed is live, unarchived and keyed; then the id is that seed. A run row is never replyable, so the button cannot open a chat that would refuse the message.
+- `title` is the job's name and `job_id` comes from the delivery log.
+
+404 when the session does not exist, 422 when it is not a cron result. A reader left open on a thread deleted under it degrades: the next fetch answers 404 and the client shows a gone state rather than a chat.
 
 ## 4. Delivery contract
 

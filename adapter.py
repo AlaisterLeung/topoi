@@ -19,6 +19,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms._shared import send_error
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
+from .cron_thread import record_delivery
 from .topic_store import home_id as _stored_home_id
 from .topic_store import home_label as _stored_home_label
 from .topic_store import is_topic_id as _is_topic_id
@@ -127,6 +128,23 @@ class TopoiAdapter(BasePlatformAdapter):
         topic = str(chat_id or self.home_topic())
         thread_id = str((metadata or {}).get("thread_id") or "")
         message_id = f"msg_{uuid.uuid4().hex[:12]}"
+        # A run-thread delivery names its job (the core puts it in the route metadata) and the thread it opened, so record the pair here. This is the only place that holds both; the seeded session names neither, and the listing needs the join to withhold the run's own transcript.
+        job_id = str((metadata or {}).get("job_id") or "")
+        if thread_id and job_id:
+            try:
+                record_delivery(
+                    topic_id=topic,
+                    thread_id=thread_id,
+                    job_id=job_id,
+                )
+            except Exception:
+                # A missing log row only means the run row keeps showing, never a lost delivery.
+                logger.warning(
+                    "[topoi] delivery log write failed for %s/%s",
+                    job_id,
+                    thread_id,
+                    exc_info=True,
+                )
         logger.info(
             "[topoi] delivery -> %s%s (%d chars)",
             topic,

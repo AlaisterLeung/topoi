@@ -9,6 +9,7 @@ Routes (CONTRACT.md section 3):
 - ``GET /threads`` - session rows resolved to topics (adapter-minted ``chat_id``, then the binding store, then a cron run's own job delivery lane), paged, newest first; only threads filed under a live topic are listed.
 - ``POST /threads/bind`` - file one session under a topic; re-filing one that is already filed elsewhere needs ``move: true`` (the row menu's Move to topic), so a client-side misfire cannot relocate a thread (409 otherwise).
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
+- ``GET /threads/{session_id}/cron`` - one cron result as a document: a mirrored run thread's brief or a run's final answer, plus whether a reply can land and where.
 
 Every registry write broadcasts ``plugin.topoi.topics.changed`` (which reaches desktop windows only when this code runs in the ``hermes serve`` backend process; from the messaging gateway it is a logged no-op). The thread list needs no plugin-side push: the desktop half refetches on the gateway's own ``sessions.changed`` event. Bindings need no broadcast at all: resolution happens server-side on every ``GET /threads``, so a binding is visible to every client the moment it lands.
 """
@@ -17,11 +18,13 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,9 @@ _DEFAULT_LIMIT = 200
 _MAX_LIMIT = 500
 # The sources the dashboard itself hides from human listings (kanban board and tool runs); the topic list mirrors that so a topic tree never shows machinery sessions.
 _HIDDEN_SOURCES = ("kanban", "tool")
+
+# A run's last write lands before ``ended_at`` is stamped, and the seed's session row carries its own start. The grace covers a slow finalize and a clock step between the two.
+_RUN_SEED_GRACE_SECONDS = 300.0
 
 
 class BindConflict(Exception):
@@ -68,6 +74,7 @@ def _load_sibling(name: str):
 
 topic_store = _load_sibling("topic_store")
 bindings = _load_sibling("bindings")
+cron_thread = _load_sibling("cron_thread")
 
 
 def _topic_id_of(
@@ -94,6 +101,55 @@ def _topic_id_of(
         if job_id:
             return cron_topics[job_id]
     return None
+
+
+def _epoch(value: Any) -> float | None:
+    """A stored epoch value as a float, or None when it is missing or unparseable."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _seeded_threads(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float | None]:
+    """The ``(topic, thread)`` pairs an adapter-minted thread session backs, each with its session's ``started_at``.
+
+    The window already drops archived and hidden rows, which is the point: a clean thread that was archived or deleted stops backing its run, so the run row comes back rather than the topic going empty. ``started_at`` is what dates a seed against the run that delivered it, since the log stores no stamp of its own.
+    """
+    return {
+        (str(row.get("chat_id") or ""), str(row.get("thread_id") or "")): _epoch(
+            row.get("started_at")
+        )
+        for row in rows
+        if str(row.get("source") or "") == PLATFORM_NAME and row.get("thread_id")
+    }
+
+
+def _run_withheld_by_thread(
+    row: dict[str, Any],
+    topic_id: str,
+    seeded: dict[tuple[str, str], float | None],
+    thread_jobs: dict[str, str],
+) -> bool:
+    """True when this run row is only the transcript behind a thread that is already listed.
+
+    Three proofs, all required: the row is a run, its job has a delivery row for a live thread under this same topic, and that thread's own session started inside the run's life. A run stays open until ``ended_at`` is stamped, so an open run's window ends now. A failed send, a run that delivered nothing (``[SILENT]``), a deleted or archived thread, a seed dated outside the run, and an unreadable log all leave the run row listed.
+    """
+    if str(row.get("source") or "") != "cron":
+        return False
+    job_id = cron_thread.run_job_id(str(row.get("id") or ""))
+    if not job_id:
+        return False
+    start = _epoch(row.get("started_at"))
+    end = _epoch(row.get("ended_at")) or time.time()
+    for (topic, thread), started in seeded.items():
+        if topic != topic_id or thread_jobs.get(thread) != job_id:
+            continue
+        if start is None or started is None:
+            continue
+        if start <= started <= end + _RUN_SEED_GRACE_SECONDS:
+            return True
+    return False
 
 
 def _is_compression_edge(child: dict[str, Any], parent: dict[str, Any]) -> bool:
@@ -168,10 +224,10 @@ def _lane_topic(value: Any, home_topic: str) -> str | None:
     return None
 
 
-def _cron_delivery_topics(profile: str | None) -> dict[str, str]:
-    """Job id -> the topic that job's runs are filed under.
+def _cron_job_index(profile: str | None) -> dict[str, dict[str, str]]:
+    """Job id -> ``{"topic": <its run's topic>, "name": <its outward name>}``.
 
-    Read from the profile's cron job store on every listing (no cache): the job is the record, so a run always resolves against the job as it stands. A job that delivers nowhere topoi-shaped is absent, and so is a job whose delivery lane names no topic this registry knows - the caller's live-topic filter then drops those runs, exactly like any other unfiled session. ``failure_deliver`` is the fallback lane the core itself uses for a failed run's notice.
+    One job-store read serves both halves a listing needs: the lane that files a run (``_cron_delivery_topics``) and the name a cron-seeded thread is titled with. Read from the profile's store on every listing, never cached: the job is the record, so a run and its thread always resolve against the job as it stands. A job that delivers nowhere topoi-shaped has no topic, and its runs are dropped by the caller's live-topic filter exactly like any other unfiled session; ``failure_deliver`` is the fallback lane the core itself uses for a failed run's notice.
 
     An unreadable job store is a debug log and no filing: a listing must never fail because cron state is mid-repair.
     """
@@ -192,7 +248,7 @@ def _cron_delivery_topics(profile: str | None) -> dict[str, str]:
         logger.debug("[topoi] cron job store unreadable; no run filing", exc_info=True)
         return {}
     home_topic = topic_store.home_id()
-    topics: dict[str, str] = {}
+    index: dict[str, dict[str, str]] = {}
     for job in jobs or []:
         if not isinstance(job, dict):
             continue
@@ -202,9 +258,100 @@ def _cron_delivery_topics(profile: str | None) -> dict[str, str]:
         topic = _lane_topic(job.get("deliver"), home_topic) or _lane_topic(
             job.get("failure_deliver"), home_topic
         )
-        if topic:
-            topics[job_id] = topic
-    return topics
+        index[job_id] = {
+            "topic": topic or "",
+            "name": _job_name(job),
+        }
+    return index
+
+
+def _cron_delivery_topics(profile: str | None) -> dict[str, str]:
+    """Job id -> the topic that job's runs are filed under (the lane half of `_cron_job_index`)."""
+    return {
+        job_id: meta["topic"]
+        for job_id, meta in _cron_job_index(profile).items()
+        if meta.get("topic")
+    }
+
+
+def _job_name(job: dict[str, Any]) -> str:
+    """A job's outward name: core's own display name when it has one, else its id."""
+    return str(job.get("name") or "").strip() or str(job.get("id") or "").strip()
+
+
+def _first_text_row(db: Any, session_id: str, role: str) -> str:
+    """The oldest text this session holds for ``role``, or ''."""
+    try:
+        rows = db.get_messages(session_id)
+    except Exception:
+        logger.debug("[topoi] result read failed for %s", session_id, exc_info=True)
+        return ""
+    for row in rows or []:
+        if str(row.get("role") or "") != role:
+            continue
+        text = str(row.get("content") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _last_text_row(db: Any, session_id: str, role: str) -> str:
+    """The newest text this session holds for ``role``, or '' (the read `_latest_message` rides)."""
+    try:
+        row_id = db.latest_message_row_id(session_id, role=role)
+        if row_id is None:
+            return ""
+        window = db.get_messages_around(session_id, int(row_id), window=0)["window"]
+    except Exception:
+        logger.debug("[topoi] result read failed for %s", session_id, exc_info=True)
+        return ""
+    return str(window[0].get("content") or "").strip() if window else ""
+
+
+def _is_silent_run(db: Any, session_id: str) -> bool:
+    """True when a run's final answer is core's own silence sentinel.
+
+    Core's matcher is imported rather than mirrored so the plugin cannot drift from the delivery gate. An unreadable transcript answers False: a row wrongly kept is a visible row, a row wrongly dropped is a lost result.
+    """
+    text = _last_text_row(db, session_id, "assistant")
+    if not text:
+        return False
+    try:
+        from cron.scheduler import _is_cron_silence_response
+    except Exception:
+        logger.debug("[topoi] cron silence matcher unavailable", exc_info=True)
+        return False
+    return bool(_is_cron_silence_response(text))
+
+
+def _cron_result_kind(row: dict[str, Any], thread_jobs: dict[str, str]) -> str | None:
+    """``'thread'`` for a mirrored run thread, ``'run'`` for a scheduled run, else None.
+
+    The ledger distinguishes a cron seed from an app-minted ``source: topoi`` chat, which shares the source but has no delivery row: without it, a normal topic chat would open in the reader instead of the composer.
+    """
+    source = str(row.get("source") or "")
+    if source == "cron":
+        return "run" if cron_thread.run_job_id(str(row.get("id") or "")) else None
+    if source == PLATFORM_NAME and row.get("thread_id"):
+        return "thread" if str(row.get("thread_id")) in thread_jobs else None
+    return None
+
+
+def _seed_title(
+    row: dict[str, Any],
+    job_index: dict[str, dict[str, str]],
+    thread_jobs: dict[str, str],
+) -> str | None:
+    """A cron-seeded thread's title: the job's name.
+
+    Both clients already show the row's last-modified time, so the name alone identifies a briefing. Core creates these sessions whole, so their stored title is NULL; a thread with no delivery row keeps the client's own fallback rather than a guessed name.
+    """
+    if str(row.get("source") or "") != PLATFORM_NAME or not row.get("thread_id"):
+        return None
+    job_id = thread_jobs.get(str(row.get("thread_id") or ""), "")
+    if not job_id:
+        return None
+    return (job_index.get(job_id) or {}).get("name") or None
 
 
 def _cron_job_id(session_id: str, cron_topics: dict[str, str]) -> str | None:
@@ -368,7 +515,7 @@ def _latest_message(db: Any, session_id: str) -> str:
             return ""
         if not window:
             continue
-        text = " ".join(str(window[0].get("content") or "").split())
+        text = _strip_cron_label(" ".join(str(window[0].get("content") or "").split()))
         if not text:
             continue
         if newest is None or int(row_id) > newest[0]:
@@ -397,6 +544,15 @@ def _one_line(text: Any, cap: int) -> str:
     return collapsed[:cap] + "..." if len(collapsed) > cap else collapsed
 
 
+# Core wraps a scheduled run's seed as ``[Cron delivery: <job>]\n<brief>``. That framing is useful in the stored transcript and noise in a preview or a search hit, which a person reads.
+_CRON_LABEL_RE = re.compile(r"^\[cron delivery:[^\]]*\]\s*", re.IGNORECASE)
+
+
+def _strip_cron_label(text: Any) -> str:
+    """One leading cron-delivery label removed from a surface the plugin renders."""
+    return _CRON_LABEL_RE.sub("", str(text or ""), count=1)
+
+
 def _search_hits(db: Any, needle: str) -> list[tuple[str, str]]:
     """The store's FTS hits for ``needle``, in rank order, as ``(session_id, snippet)``.
 
@@ -417,7 +573,9 @@ def _search_hits(db: Any, needle: str) -> list[tuple[str, str]]:
         session_id = str(row.get("session_id") or "")
         if not session_id:
             continue
-        snippet = str(row.get("snippet") or "").replace(">>>", "").replace("<<<", "")
+        snippet = _strip_cron_label(
+            str(row.get("snippet") or "").replace(">>>", "").replace("<<<", "")
+        )
         hits.append((session_id, _one_line(snippet, SNIPPET_CHARS)))
     return hits
 
@@ -482,7 +640,7 @@ async def get_threads(
 
     ``q`` searches the listed set (one topic's threads when ``topic`` is given): the transcript through the store's FTS index, then the title and the row preview as substrings, both before pagination so ``total`` counts the matches. A transcript hit carries its matched line as ``match`` (for a row tooltip) and hits rank ahead of title-only matches.
 
-    Scheduled runs are listed here too: a ``source: cron`` row resolves to the topic its job delivers to (``_cron_delivery_topics``), so a briefing is one session shown under its topic and under the Cron platform listing, never a copy.
+    Scheduled runs are listed here too: a ``source: cron`` row resolves to the topic its job delivers to (``_cron_delivery_topics``). When that run delivered into a run thread whose seeded session is listed, the run row is withheld here - the clean thread is the reading copy, and the Cron platform listing still shows the run. A run that delivered into no thread (``[SILENT]``, a failed send, a deleted thread) is listed as the run row, so no result goes missing.
     """
     scope = {
         "exclude_sources": list(_HIDDEN_SOURCES),
@@ -496,11 +654,35 @@ async def get_threads(
         binding_map = bindings.mapping()
 
         def resolve_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            # The delivery lanes are read only when the window carries a run: most listings
-            # hold none, and a job-store read per refetch would be pure overhead.
-            cron_topics = (
-                _cron_delivery_topics(profile)
-                if any(str(row.get("source") or "") == "cron" for row in rows)
+            # The job store and the delivery log are read only when the window needs them: most
+            # listings carry no run and no untitled seed, and either read would be pure overhead.
+            has_runs = any(str(row.get("source") or "") == "cron" for row in rows)
+            has_topoi_thread = any(
+                str(row.get("source") or "") == PLATFORM_NAME and row.get("thread_id")
+                for row in rows
+            )
+            has_untitled_seed = any(
+                str(row.get("source") or "") == PLATFORM_NAME
+                and row.get("thread_id")
+                and not str(row.get("title") or "").strip()
+                for row in rows
+            )
+            job_index = (
+                _cron_job_index(profile)
+                if (has_runs or has_untitled_seed or has_topoi_thread)
+                else {}
+            )
+            cron_topics = {
+                job_id: meta["topic"]
+                for job_id, meta in job_index.items()
+                if meta.get("topic")
+            }
+            seeded_threads = (
+                _seeded_threads(rows) if (has_runs or has_topoi_thread) else {}
+            )
+            thread_jobs = (
+                cron_thread.jobs_by_thread()
+                if (has_runs or has_topoi_thread or has_untitled_seed)
                 else {}
             )
             out = []
@@ -514,19 +696,47 @@ async def get_threads(
                 # and rows under a deleted topic both drop here, before pagination.
                 if topic_id not in live:
                     continue
+                # A run whose run thread is listed does not also list as itself: the clean
+                # thread is the reading copy, and the Cron platform listing keeps the run.
+                if _run_withheld_by_thread(row, topic_id, seeded_threads, thread_jobs):
+                    continue
+                kind = _cron_result_kind(row, thread_jobs)
+                # A finished run that answered with core's silence sentinel produced no result,
+                # so it is not filed. An open run may still deliver, and a run that delivered
+                # anything at all never answers with the sentinel.
+                if (
+                    kind == "run"
+                    and row.get("ended_at") is not None
+                    and _is_silent_run(db, tip)
+                ):
+                    continue
                 if topic is not None and topic_id != topic:
                     continue
+                thread_key = (
+                    str(row.get("chat_id") or ""),
+                    str(row.get("thread_id") or ""),
+                )
                 out.append(
                     {
                         "session_id": tip,
                         "lineage_root": root,
                         "topic_id": topic_id,
-                        "title": row.get("title"),
+                        "title": str(row.get("title") or "").strip()
+                        or _seed_title(row, job_index, thread_jobs),
                         "latest_message": _latest_message(db, tip),
                         "started_at": row.get("started_at"),
                         "last_active": row.get("last_active"),
                         "message_count": row.get("message_count"),
                         "source": str(row.get("source") or "cli"),
+                        # A cron result is read, not chatted: the desktop opens its own reader
+                        # for these rows unless replyable hands it the seeded chat.
+                        "cron_result": bool(kind),
+                        "cron_kind": kind,
+                        "replyable": bool(
+                            kind == "thread"
+                            and thread_key in seeded_threads
+                            and str(row.get("session_key") or "").strip()
+                        ),
                     }
                 )
             return out
@@ -557,6 +767,66 @@ async def get_threads(
     return {"threads": threads, "total": total, "limit": limit, "offset": offset}
 
 
+@router.get("/threads/{session_id}/cron")
+async def get_cron_result(
+    session_id: str, profile: str | None = None
+) -> dict[str, Any]:
+    """One cron result as a document, for the desktop's reader tab.
+
+    ``kind: thread`` is a mirrored run thread, whose brief is the seed's first user turn with core's delivery label stripped. ``kind: run`` is a scheduled run with no mirror, whose result is its final answer. The two need different reads because a mirrored thread never holds the run's own transcript, which is what the mirror is for.
+
+    ``replyable`` is the mirror proof and nothing else: a delivery row exists for this thread, its seed session is alive and unarchived, and the seed carries its session key. A run row is never replyable, so the button can never open a chat that would refuse the message.
+
+    A client opens this from a row it already listed, so it never needs to know which kind it opened: ``session_id`` is that row's own id. Unknown ids answer 404, sessions that are not cron results answer 422, and a brief whose run was deleted answers with an empty markdown rather than an error so an open reader degrades instead of throwing.
+    """
+    db = _open_db(profile)
+    try:
+        row = db.get_session(session_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"no such session: {session_id}"
+            )
+        thread_jobs = cron_thread.jobs_by_thread()
+        kind = _cron_result_kind(row, thread_jobs)
+        if kind is None:
+            raise HTTPException(
+                status_code=422, detail="this session is not a cron result"
+            )
+        job_id = (
+            thread_jobs.get(str(row.get("thread_id") or ""), "")
+            if kind == "thread"
+            else (cron_thread.run_job_id(str(row.get("id") or "")) or "")
+        )
+        markdown = (
+            _strip_cron_label(_first_text_row(db, session_id, "user"))
+            if kind == "thread"
+            else _last_text_row(db, session_id, "assistant")
+        )
+        replyable = bool(
+            kind == "thread"
+            and not row.get("archived")
+            and str(row.get("session_key") or "").strip()
+        )
+        job_index = _cron_job_index(profile)
+        title = (
+            (job_index.get(job_id) or {}).get("name")
+            or str(row.get("title") or "").strip()
+            or job_id
+            or session_id
+        )
+        return {
+            "session_id": session_id,
+            "kind": kind,
+            "title": title,
+            "markdown": markdown,
+            "job_id": job_id or None,
+            "replyable": replyable,
+            "reply_session_id": session_id if replyable else None,
+        }
+    finally:
+        db.close()
+
+
 @router.post("/threads/bind")
 async def bind_thread(
     body: dict[str, Any], profile: str | None = None
@@ -582,11 +852,22 @@ async def bind_thread(
 
 
 @router.delete("/threads/{session_id}")
-async def delete_thread(session_id: str, profile: str | None = None) -> dict[str, Any]:
+async def delete_thread(
+    session_id: str,
+    request: Request,
+    profile: str | None = None,
+    request_id: str | None = None,
+    expected_revision: int | None = None,
+    expected_generation: int | None = None,
+) -> dict[str, Any]:
     """Delete one thread and drop its binding.
 
     The row, its compression chain and its on-disk transcripts go through the core's own session delete - the same handler the desktop's own delete rides, so behavior cannot drift: an already-absent session is a no-op success, a session under an active turn is a 409. The binding is resolved from the lineage root while the row still exists and dropped after the delete, so a deleted thread never leaves a binding behind.
+
+    ``request_id`` / ``expected_revision`` / ``expected_generation`` are the caller's mutation fence for a core that fences session writes; passing them through unchanged keeps this route exactly as strict as the desktop's own delete. A core that predates the fence ignores them.
     """
+    from inspect import signature
+
     from hermes_cli.web_routers.sessions import delete_session_endpoint
 
     db = _open_db(profile)
@@ -594,7 +875,25 @@ async def delete_thread(session_id: str, profile: str | None = None) -> dict[str
         root = _lineage_root(db, session_id)
     finally:
         db.close()
-    result = await delete_session_endpoint(session_id, profile)
+    # Core's delete endpoint gained a ``request`` parameter (the mutation principal rides it) and
+    # the dashboard and the gateway can sit on different core revisions mid-update, so forward the
+    # fence only to a core whose signature accepts it.
+    params = list(signature(delete_session_endpoint).parameters)
+    if params[1:2] == ["request"]:
+        fence = {
+            "request_id": request_id,
+            "expected_revision": expected_revision,
+            "expected_generation": expected_generation,
+        }
+        result = await delete_session_endpoint(
+            session_id,
+            request,
+            profile,
+            **{key: value for key, value in fence.items() if key in params},
+        )
+    else:
+        # An older core takes the profile second; the signature check above is what decides.
+        result = await delete_session_endpoint(session_id, profile)  # type: ignore[arg-type]
     if root is not None:
         bindings.drop_roots([root])
     return result

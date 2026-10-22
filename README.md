@@ -1,6 +1,6 @@
 # Topoi. - groups your Hermes Agent chats into topics
 
-Topoi groups every Hermes Agent chat under different topics in Hermes Desktop, so your conversations are easy to find again.
+Topoi groups every Hermes Agent chat under topics you defined in Hermes Desktop, so your conversations are easy to find again.
 
 ## Features
 

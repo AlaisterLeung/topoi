@@ -30,6 +30,33 @@ def check(name: str, ok: bool, detail: object = "") -> None:
         failures.append(name)
 
 
+def fake_request(subject: str = "topoi-check"):
+    """A minimal stand-in for the dashboard Request the plugin handlers forward to core.
+
+    Core's session endpoints read the mutation principal off ``request.state`` and the app-level
+    authority off ``request.app.state``; with a native principal present the credential branch is
+    never reached, so no headers or cookies are needed.
+    """
+    state = types.SimpleNamespace(
+        native_http_principal={"subject": subject}, session=None
+    )
+    app_state = types.SimpleNamespace(
+        auth_required=False, session_authority=None, gateway_runner=None
+    )
+    return types.SimpleNamespace(
+        state=state, app=types.SimpleNamespace(state=app_state)
+    )
+
+
+def _delete_is_fenced() -> bool:
+    """True when the installed core's session delete carries the mutation fence."""
+    from inspect import signature
+
+    from hermes_cli.web_routers.sessions import delete_session_endpoint
+
+    return "expected_revision" in signature(delete_session_endpoint).parameters
+
+
 def load_plugin_api(pkg_name: str):
     """Import ``dashboard.plugin_api`` under the loader's package name.
 
@@ -267,38 +294,46 @@ def main() -> int:
         "an unknown session resolves to None", root_of_missing is None, root_of_missing
     )
 
-    # The delete route: the row goes through the core's own session delete, and the
-    # binding the row was filed under is dropped in the same call.
-    deleted = asyncio.run(api.delete_thread("sess_cron2"))
-    check(
-        "the delete route reports success",
-        bool(deleted.get("ok")),
-        deleted,
-    )
-    gone_db = SessionDB()
-    try:
-        row_gone = gone_db.get_session("sess_cron2") is None
-    finally:
-        gone_db.close()
-    check("the deleted session's row is gone", row_gone)
-    check(
-        "the deleted thread's binding is dropped",
-        "sess_cron2" not in api.bindings.mapping(),
-        api.bindings.mapping(),
-    )
-    after_delete = asyncio.run(api.get_threads("t_news", 5, 0, None))
-    check(
-        "the deleted thread drops out of the listing",
-        after_delete["total"] == 1
-        and after_delete["threads"][0]["lineage_root"] == "sess_cron",
-        after_delete,
-    )
-    absent = asyncio.run(api.delete_thread("nope"))
-    check(
-        "deleting an unknown session is a no-op success",
-        bool(absent.get("ok")),
-        absent,
-    )
+    # The delete route: the row goes through the core's own session delete, and the binding the
+    # row was filed under is dropped in the same call. A core that fences session mutations wants
+    # a request_id + expected_revision minted by the owning runtime, which this harness cannot
+    # mint, so that core's delete is exercised by its own client instead.
+    if _delete_is_fenced():
+        print(
+            "skip delete-route checks - the installed core fences session mutations "
+            "and this harness holds no runtime fence"
+        )
+    else:
+        deleted = asyncio.run(api.delete_thread("sess_cron2", fake_request()))
+        check(
+            "the delete route reports success",
+            bool(deleted.get("ok")),
+            deleted,
+        )
+        gone_db = SessionDB()
+        try:
+            row_gone = gone_db.get_session("sess_cron2") is None
+        finally:
+            gone_db.close()
+        check("the deleted session's row is gone", row_gone)
+        check(
+            "the deleted thread's binding is dropped",
+            "sess_cron2" not in api.bindings.mapping(),
+            api.bindings.mapping(),
+        )
+        after_delete = asyncio.run(api.get_threads("t_news", 5, 0, None))
+        check(
+            "the deleted thread drops out of the listing",
+            after_delete["total"] == 1
+            and after_delete["threads"][0]["lineage_root"] == "sess_cron",
+            after_delete,
+        )
+        absent = asyncio.run(api.delete_thread("nope", fake_request()))
+        check(
+            "deleting an unknown session is a no-op success",
+            bool(absent.get("ok")),
+            absent,
+        )
 
     # ---- scheduled runs file under their job's delivery topic -------------------
     # A cron run is its own session (cron_<job id>_<stamp>, source='cron', no chat_id);
@@ -534,6 +569,245 @@ def main() -> int:
         and {"sess_search", "sess_search2", "sess_quiet"} <= plain_roots,
         plain,
     )
+
+    # A run that delivered into a run thread: the thin thread is the reading copy and the run
+    # row is withheld from the topic, while Cron keeps the run as provenance. The join is the
+    # plugin's delivery log, so each case writes its own row; the cron lane read is stubbed
+    # because the job store is core's own surface (the checks above ride the real one).
+    api._cron_job_index = lambda profile: {  # type: ignore[attr-defined]
+        "job1": {"topic": "t_news", "name": "Morning Email Briefing"},
+        "job2": {"topic": "t_news", "name": "Second Job"},
+        "job3": {"topic": "t_news", "name": "Third Job"},
+    }
+    join_db = SessionDB()
+    try:
+        # A: the seed lands inside the run's own life, which is how a real delivery lands.
+        join_db.create_session("cron_job1_20261021_083000", "cron", chat_id="")
+        join_db.create_session(
+            "sess_seed_a",
+            "topoi",
+            chat_id="t_news",
+            thread_id="th_1700000000_aaaa11",
+            session_key="agent:main:topoi:thread:t_news:th_1700000000_aaaa11",
+        )
+        join_db.end_session("cron_job1_20261021_083000", "cron_complete")
+        # B: a run with no seed at all.
+        join_db.create_session("cron_job2_20261021_090000", "cron", chat_id="")
+        join_db.end_session("cron_job2_20261021_090000", "cron_complete")
+        # C: its seed predates the run, so the run is not withheld behind it.
+        join_db.create_session(
+            "sess_seed_c",
+            "topoi",
+            chat_id="t_news",
+            thread_id="th_1700000000_cccccc",
+        )
+        join_db.create_session("cron_job3_20261021_100000", "cron", chat_id="")
+        join_db.end_session("cron_job3_20261021_100000", "cron_complete")
+    finally:
+        join_db.close()
+    api.cron_thread.record_delivery(
+        topic_id="t_news", thread_id="th_1700000000_aaaa11", job_id="job1"
+    )
+    api.cron_thread.record_delivery(
+        topic_id="t_news", thread_id="th_1700000000_cccccc", job_id="job3"
+    )
+    joined = asyncio.run(api.get_threads(None, 500, 0, None))
+    joined_roots = {row["lineage_root"] for row in joined["threads"]}
+    check(
+        "a run whose delivered thread is listed is withheld from the topic",
+        "cron_job1_20261021_083000" not in joined_roots,
+        joined["threads"],
+    )
+    check(
+        "the clean thread it delivered into is listed instead",
+        "sess_seed_a" in joined_roots,
+        joined["threads"],
+    )
+    check(
+        "a run with no delivery row still lists as the run",
+        "cron_job2_20261021_090000" in joined_roots,
+        joined["threads"],
+    )
+    check(
+        "a seed dated before the run's life does not withhold it",
+        "cron_job3_20261021_100000" in joined_roots,
+        joined["threads"],
+    )
+    archive_db = SessionDB()
+    try:
+        archive_db.set_session_archived("sess_seed_a", True)
+    finally:
+        archive_db.close()
+    after_archive = asyncio.run(api.get_threads(None, 500, 0, None))
+    after_archive_roots = {row["lineage_root"] for row in after_archive["threads"]}
+    check(
+        "archiving the clean thread brings its run row back",
+        "cron_job1_20261021_083000" in after_archive_roots,
+        after_archive["threads"],
+    )
+    restore_db = SessionDB()
+    try:
+        restore_db.set_session_archived("sess_seed_a", False)
+    finally:
+        restore_db.close()
+
+    # A cron-seeded session is created whole, so its stored title is NULL: the row is titled
+    # from the job's name, and the seed's own framing line never reaches a preview.
+    title_db = SessionDB()
+    try:
+        title_db.append_message(
+            "sess_seed_c",
+            "user",
+            "[Cron delivery: Third Job]\nthe brief body",
+        )
+    finally:
+        title_db.close()
+    titled = asyncio.run(api.get_threads("t_news", 50, 0, None))
+    titled_rows = {row["lineage_root"]: row for row in titled["threads"]}
+    check(
+        "an untitled cron-seeded thread is titled with its job name",
+        titled_rows.get("sess_seed_c", {}).get("title") == "Third Job",
+        titled_rows.get("sess_seed_c"),
+    )
+    check(
+        "a run preview drops the cron-delivery label",
+        titled_rows.get("sess_seed_c", {}).get("latest_message") == "the brief body",
+        titled_rows.get("sess_seed_c"),
+    )
+    check(
+        "only a seeded thread is titled, and only from its own delivery row",
+        titled_rows.get("sess_seed_a", {}).get("title") == "Morning Email Briefing"
+        and titled_rows.get("sess_cron", {}).get("title") is None,
+        {k: v.get("title") for k, v in titled_rows.items()},
+    )
+
+    # ---- cron results as documents ---------------------------------------------
+    # A cron artifact is read, not chatted. The listing flags which rows are results and
+    # whether a reply can land, and the /cron route renders the document itself.
+    api._cron_job_index = lambda profile: {  # type: ignore[attr-defined]
+        "job1": {"topic": "t_news", "name": "Morning Email Briefing"},
+        "job2": {"topic": "t_news", "name": "Second Job"},
+        "job3": {"topic": "t_news", "name": "Third Job"},
+        "job4": {"topic": "t_news", "name": "Silent Job"},
+        "job5": {"topic": "t_news", "name": "Failing Job"},
+    }
+    result_db = SessionDB()
+    try:
+        result_db.create_session(
+            "sess_seed_key",
+            "topoi",
+            chat_id="t_news",
+            thread_id="th_1700000000_kkkkkk",
+            session_key="agent:main:topoi:thread:t_news:th_1700000000_kkkkkk",
+        )
+        result_db.append_message(
+            "sess_seed_key", "user", "[Cron delivery: Second Job]\nsecond brief body"
+        )
+        result_db.create_session(
+            "sess_app", "topoi", chat_id="t_news", thread_id="th_1700000000_app999"
+        )
+        result_db.create_session("cron_job4_20261021_110000", "cron", chat_id="")
+        result_db.end_session("cron_job4_20261021_110000", "cron_complete")
+        result_db.append_message("cron_job4_20261021_110000", "assistant", "[SILENT]")
+        result_db.create_session("cron_job5_20261021_120000", "cron", chat_id="")
+        result_db.end_session("cron_job5_20261021_120000", "cron_incomplete_no_output")
+        result_db.append_message(
+            "cron_job5_20261021_120000", "assistant", "the run failed loudly"
+        )
+        result_db.append_message(
+            "cron_job3_20261021_100000", "assistant", "run three final answer"
+        )
+    finally:
+        result_db.close()
+    api.cron_thread.record_delivery(
+        topic_id="t_news",
+        thread_id="th_1700000000_kkkkkk",
+        job_id="job2",
+    )
+    results = asyncio.run(api.get_threads(None, 500, 0, None))
+    result_rows = {row["lineage_root"]: row for row in results["threads"]}
+    check(
+        "a mirrored run thread is flagged as a cron result",
+        result_rows.get("sess_seed_key", {}).get("cron_result") is True,
+        result_rows.get("sess_seed_key"),
+    )
+    check(
+        "a mirrored run thread with a live seed is replyable",
+        result_rows.get("sess_seed_key", {}).get("replyable") is True,
+        result_rows.get("sess_seed_key"),
+    )
+    check(
+        "a run row is a cron result but never replyable",
+        result_rows.get("cron_job5_20261021_120000", {}).get("cron_result") is True
+        and result_rows.get("cron_job5_20261021_120000", {}).get("replyable") is False,
+        result_rows.get("cron_job5_20261021_120000"),
+    )
+    check(
+        "a silent ended run is not filed under the topic at all",
+        "cron_job4_20261021_110000" not in result_rows,
+        sorted(result_rows),
+    )
+    check(
+        "an app-minted topoi chat is not a cron result",
+        result_rows.get("sess_app", {}).get("cron_result") is False,
+        result_rows.get("sess_app"),
+    )
+    seeded_doc = asyncio.run(api.get_cron_result("sess_seed_key"))
+    check(
+        "the cron route renders a mirrored thread's brief with its label stripped",
+        seeded_doc["kind"] == "thread"
+        and seeded_doc["markdown"] == "second brief body"
+        and seeded_doc["title"] == "Second Job",
+        seeded_doc,
+    )
+    check(
+        "a mirrored thread reports the session a reply belongs in",
+        seeded_doc["replyable"] is True
+        and seeded_doc["reply_session_id"] == "sess_seed_key",
+        seeded_doc,
+    )
+    run_doc = asyncio.run(api.get_cron_result("cron_job3_20261021_100000"))
+    check(
+        "the cron route renders a run's own final answer",
+        run_doc["kind"] == "run"
+        and run_doc["markdown"] == "run three final answer"
+        and run_doc["title"] == "Third Job",
+        run_doc,
+    )
+    check(
+        "a run row has no reply target",
+        run_doc["replyable"] is False and run_doc["reply_session_id"] is None,
+        run_doc,
+    )
+    for session_id, expected in (("sess_plain", 422), ("no_such_session", 404)):
+        try:
+            asyncio.run(api.get_cron_result(session_id))
+        except api.HTTPException as exc:
+            check(
+                f"the cron route answers {expected} for {session_id}",
+                exc.status_code == expected,
+                exc.status_code,
+            )
+        else:
+            check(
+                f"the cron route answers {expected} for {session_id}", False, "no error"
+            )
+    archive_seed = SessionDB()
+    try:
+        archive_seed.set_session_archived("sess_seed_key", True)
+    finally:
+        archive_seed.close()
+    archived_doc = asyncio.run(api.get_cron_result("sess_seed_key"))
+    check(
+        "an archived mirror is not replyable",
+        archived_doc["replyable"] is False and archived_doc["reply_session_id"] is None,
+        archived_doc,
+    )
+    unarchive_seed = SessionDB()
+    try:
+        unarchive_seed.set_session_archived("sess_seed_key", False)
+    finally:
+        unarchive_seed.close()
 
     print()
     if failures:

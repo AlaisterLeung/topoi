@@ -1,7 +1,7 @@
 name: topoi
 label: Topoi
 kind: platform
-version: 1.0.0
+version: 1.0.1
 description: >
   Group your chats into topics. Your chats are organized by topic in the desktop app.
   Cron job results arrive as topic threads you can reply to.
