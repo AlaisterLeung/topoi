@@ -52,6 +52,10 @@ import { jsx, jsxs } from "react/jsx-runtime";
 // (its Load more button appends the next page of the same size).
 const PANE_THREADS = 4;
 const PAGE_SIZE = 10;
+// A section lists only threads whose last activity is inside this window;
+// older ones are not rows, they fold into the section's "N more" count.
+const PANE_ACTIVE_DAYS = 7;
+const PANE_ACTIVE_MS = PANE_ACTIVE_DAYS * 24 * 60 * 60 * 1000;
 // A keystroke is not a query: the topic tab's search box waits out this gap, so
 // typing a word costs one page request instead of one per letter.
 const SEARCH_DEBOUNCE_MS = 220;
@@ -1134,8 +1138,23 @@ function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
   });
 }
 
+// A thread's activity stamp in epoch milliseconds. The REST surface ships
+// SECONDS; a row with neither stamp reads as undated, never as ancient.
+const threadStamp = (thread) => {
+  const seconds = thread.last_active || thread.started_at || 0;
+  return seconds * 1000;
+};
+
+const isRecentThread = (thread, now) => {
+  const stamp = threadStamp(thread);
+  return stamp === 0 || now - stamp < PANE_ACTIVE_MS;
+};
+
 function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle, threads }) {
-  const shown = threads.slice(0, PANE_THREADS);
+  const now = Date.now();
+  const shown = threads.filter((thread) => isRecentThread(thread, now)).slice(0, PANE_THREADS);
+  // Threads past the window are hidden rows but still counted: "N more" is how
+  // many the section is holding back, and its button opens the full list.
   const hidden = threads.length - shown.length;
   return jsxs("div", {
     className: "topoi-section",
@@ -1166,9 +1185,6 @@ function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle,
           type: "button",
           children: `${hidden} more`,
         }),
-      expanded &&
-        threads.length === 0 &&
-        jsx("div", { className: "topoi-note", children: "No threads yet." }),
     ],
   });
 }
