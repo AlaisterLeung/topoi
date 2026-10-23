@@ -172,10 +172,38 @@ const topicTabs = new Map();
 // The cron readers this plugin has open, keyed by session id: a second click
 // fronts the same tab instead of stacking a duplicate.
 const cronReaders = new Map();
-// The cron result being read, by row session id, or null. The sidebar row
-// reads it to keep its active highlight: a cron row opens a workspace tab, so
-// core's own active session never moves and cannot drive the pane's selection.
-const $cronReaderId = atom(null);
+// The cron readers this plugin has OPEN, by row session id. A Set, because
+// several reader tabs can be open at once (the Map above only holds their
+// closers), and a row bands when its OWN reader tab holds the zone's active
+// slot - so this is the "we really opened one" guard, never the selection. A
+// single-id atom here named only the reader opened last, and every earlier
+// reader lost its band the moment another tab was fronted.
+const $cronReaderIds = atom(new Set());
+// Delete-then-add keeps insertion order honest: the last entry is the reader
+// opened most recently, which is all a host without pane visibility can know.
+const addCronReader = (sessionId) => {
+  const next = new Set($cronReaderIds.get());
+  next.delete(sessionId);
+  next.add(sessionId);
+  $cronReaderIds.set(next);
+};
+const dropCronReader = (sessionId) => {
+  const next = new Set($cronReaderIds.get());
+  next.delete(sessionId);
+  $cronReaderIds.set(next);
+};
+// The pane read every row falls back to: an always-false atom for a desktop
+// without the visibility door and for rows that cannot be open at all. Hooks
+// run in the same order on every render, so there is always something to read.
+const NO_TAB = atom(false);
+// A layout pane's on-screen truth - does it hold its zone's active tab slot?
+// `host.paneVisibility` answers that for core's `workspace` / `session-tile:<id>`
+// panes and for our own reader tabs, and the open band follows it so exactly
+// ONE thread row is lit. Feature-detected per call: a desktop without the door
+// answers NO_TAB and the band keeps its older focus/reader-atom rules.
+const paneTab = (paneId) =>
+  typeof host.paneVisibility === "function" ? host.paneVisibility(paneId) : NO_TAB;
+const paneTabsReadable = () => typeof host.paneVisibility === "function";
 // The armed New thread filing, if any: the topic to file under plus the chat
 // id that was focused when the click happened (never the one we want). An
 // atom so the composer banner re-renders when the arm changes.
@@ -292,13 +320,13 @@ function openCronReader(thread) {
     dock: { pane: "workspace", pos: "center" },
     onClose: () => {
       cronReaders.delete(sessionId);
-      if ($cronReaderId.get() === sessionId) $cronReaderId.set(null);
+      dropCronReader(sessionId);
     },
     render: () => jsx(CronReader, { thread }),
     title: thread.title || "Cron result",
   });
   cronReaders.set(sessionId, close);
-  $cronReaderId.set(sessionId);
+  addCronReader(sessionId);
 }
 
 // Opening a thread from its TOPIC TAB replaces the tab: the session opens as
@@ -885,9 +913,9 @@ function CronReader({ thread }) {
   const when = thread?.last_active;
   const reply = () => {
     if (!doc?.replyable || !doc.reply_session_id) return;
-    // Core's focus moves to the seeded session, and the pane's chat case reads
-    // that focus: the reader's own highlight is spent the moment we hand off.
-    $cronReaderId.set(null);
+    // Core's focus moves to the seeded session and the chat tab takes the
+    // zone's active slot, so the reader's band moves off on its own. The
+    // reader tab stays open behind the chat: nothing to clear here.
     host
       .openSession(doc.reply_session_id, { intent: "tab" })
       .catch((error) => host.notifyError(error, "Could not open the thread"));
@@ -959,14 +987,39 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
   const when = seconds ? formatAge(seconds) : null;
   // A thread carries its live tip (session_id) and its lineage root; the
   // focused id and the status map can hold either, so match both.
-  // A cron result opens as a workspace tab, so core's focused session never
-  // moves: the reader atom is what keeps that row lit while it is on screen.
-  const reading = useValue($cronReaderId) === thread.session_id;
-  const opened =
-    showStatus &&
-    (reading ||
-      (focused != null &&
-        (thread.session_id === focused || thread.lineage_root === focused)));
+  // The open band follows the FRONT TAB, not the focus: a cron reader and a chat
+  // tile share the workspace zone, and core's focused session keeps pointing at
+  // the chat while the reader is fronted - so a focus test alone lit the chat
+  // row and the reader row at once (switching tabs cleared neither).
+  const readerIds = useValue($cronReaderIds);
+  const isReader = readerIds.has(thread.session_id);
+  const focusHit =
+    focused != null &&
+    (thread.session_id === focused || thread.lineage_root === focused);
+  // Only rows that CAN be lit subscribe to the layout: the reader's own tab
+  // while it is the result being read, and the focused chat's panes (the
+  // primary `workspace` chat or its `session-tile:<id>` stack entry).
+  const readerTab = useValue(
+    isReader ? paneTab(`plugin-workspace:cron-${thread.session_id}`) : NO_TAB,
+  );
+  const primaryTab = useValue(focusHit ? paneTab("workspace") : NO_TAB);
+  const tileTab = useValue(
+    focusHit ? paneTab(`session-tile:${thread.session_id}`) : NO_TAB,
+  );
+  const rootTab = useValue(
+    focusHit && thread.lineage_root
+      ? paneTab(`session-tile:${thread.lineage_root}`)
+      : NO_TAB,
+  );
+  const readable = paneTabsReadable();
+  // Several readers can be open at once, so every row asks about its OWN tab.
+  // A doorless host cannot say which of them is in front, so the reader opened
+  // last keeps the band there (the old single-id rule).
+  const reading = readable
+    ? isReader && readerTab
+    : isReader && [...readerIds].at(-1) === thread.session_id;
+  const fronted = !readable || primaryTab || tileTab || rootTab;
+  const opened = showStatus && (reading || (focusHit && fronted));
   const status = showStatus
     ? (statuses[thread.session_id] ?? statuses[thread.lineage_root] ?? "idle")
     : "idle";
