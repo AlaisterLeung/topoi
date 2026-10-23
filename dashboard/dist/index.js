@@ -202,7 +202,6 @@
           maxLength: 120,
           className: "h-8 w-56",
           "aria-label": "Topic name",
-          disabled: props.busy,
           onChange: function (e) {
             props.onDraftChange(e.target.value);
           },
@@ -272,7 +271,7 @@
             key: "save",
             size: "sm",
             ghost: true,
-            disabled: props.busy || !props.draftName.trim(),
+            disabled: !props.draftName.trim(),
             onClick: props.onSaveEdit,
             "aria-label": "Save",
             title: "Save",
@@ -287,7 +286,6 @@
             key: "cancel",
             size: "sm",
             ghost: true,
-            disabled: props.busy,
             onClick: props.onCancelEdit,
             "aria-label": "Cancel",
             title: "Cancel",
@@ -303,7 +301,6 @@
             key: "rename",
             size: "sm",
             ghost: true,
-            disabled: props.busy,
             onClick: props.onStartEdit,
             "aria-label": "Rename this topic",
             title: "Rename this topic",
@@ -318,7 +315,7 @@
             key: "home",
             size: "sm",
             ghost: true,
-            disabled: props.busy || props.isHome,
+            disabled: props.isHome,
             onClick: props.onSetHome,
             "aria-label": props.isHome ? "This is the home topic" : "Set home",
             title: props.isHome ? "This is the home topic" : "Set as home topic",
@@ -346,7 +343,6 @@
             size: "sm",
             ghost: true,
             destructive: true,
-            disabled: props.busy,
             onClick: props.threadCount > 0 ? props.onToggleArchive : props.onDelete,
             "aria-label": dangerLabel,
             title: dangerLabel,
@@ -361,7 +357,7 @@
             key: "up",
             size: "sm",
             ghost: true,
-            disabled: props.busy || props.first,
+            disabled: props.first,
             onClick: function () {
               props.onMove(-1);
             },
@@ -378,7 +374,7 @@
             key: "down",
             size: "sm",
             ghost: true,
-            disabled: props.busy || props.last,
+            disabled: props.last,
             onClick: function () {
               props.onMove(1);
             },
@@ -517,7 +513,22 @@
     // The id field opens on the locked t_ prefix; the suffix is the user's part.
     const [newId, setNewId] = useState("t_");
     const [editing, setEditing] = useState(null);
-    const [busy, setBusy] = useState(false);
+    // The registry the page paints, kept beside the render state so a click that
+    // lands before React re-renders still builds on what the last click painted.
+    const stateRef = useRef(null);
+    // Whole-state, last-writer-wins: one write is on the wire at a time and the
+    // newest request wins, so a burst of moves can never interleave two writes.
+    // `confirmed` is the last registry the server stored (the revert target),
+    // `pending` the newest request it has not answered yet.
+    const confirmed = useRef(null);
+    const pending = useRef(null);
+    const draining = useRef(null);
+    const threadsStale = useRef(false);
+
+    const paint = useCallback(function (next) {
+      stateRef.current = next;
+      setState(next);
+    }, []);
 
     const load = useCallback(async function () {
       return Promise.all([
@@ -525,7 +536,9 @@
         SDK.fetchJSON(API + "/threads?limit=" + THREAD_PAGE),
       ])
         .then(function (results) {
-          setState(results[0]);
+          confirmed.current = results[0];
+          // A write already on its way owns the order: it paints the newer one.
+          if (!pending.current) paint(results[0]);
           const list = (results[1] && results[1].threads) || [];
           setThreads(list);
           setError(null);
@@ -539,7 +552,7 @@
           setLoading(false);
           return ok;
         });
-    }, []);
+    }, [paint]);
 
     useEffect(
       function () {
@@ -548,59 +561,78 @@
       [load],
     );
 
-    // Whole-state, last-writer-wins: a registry write replaces the block, so
-    // every mutation rebuilds from the state the page last loaded and the
-    // response becomes the new loaded state.
-    const save = useCallback(
-      function (next) {
-        return SDK.fetchJSON(API + "/topics", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(next),
-        })
-          .then(function (stored) {
-            setState(stored);
-            setError(null);
-            // A delete prunes its bindings in the same write, so the session
-            // grouping has to be refetched with the registry.
-            return load();
-          })
-          .catch(function (err) {
-            setError(parseApiErrorMessage(err));
+    // The write loop. A refused write drops the queue and puts the page back on
+    // the last registry the server confirmed, so the order the user saw reverted
+    // and the banner names the server's reason; nothing re-sends a lost request.
+    const flush = useCallback(
+      function () {
+        if (draining.current) return draining.current;
+        const task = (async function () {
+          let failed = false;
+          try {
+            while (pending.current) {
+              const want = pending.current;
+              pending.current = null;
+              try {
+                const stored = await SDK.fetchJSON(API + "/topics", {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(want),
+                });
+                confirmed.current = stored;
+                setError(null);
+                // A newer click already painted its own order: keep it.
+                if (!pending.current) paint(stored);
+              } catch (err) {
+                failed = true;
+                pending.current = null;
+                setError(parseApiErrorMessage(err));
+                if (confirmed.current) paint(confirmed.current);
+              }
+            }
+          } finally {
+            draining.current = null;
+          }
+          if (failed) {
+            threadsStale.current = false;
             return false;
-          });
+          }
+          // A delete prunes its bindings in the same write, so the session
+          // grouping is refetched with the registry; a reorder moves no thread.
+          if (!threadsStale.current) return true;
+          threadsStale.current = false;
+          return load();
+        })();
+        draining.current = task;
+        return task;
       },
-      [load],
+      [load, paint],
     );
 
-    // One mutation at a time: two interleaved PUTs would clobber each other.
-    const run = useCallback(
-      function (fn) {
-        if (busy) return Promise.resolve(false);
-        setBusy(true);
-        return Promise.resolve()
-          .then(fn)
-          .catch(function (err) {
-            setError(parseApiErrorMessage(err));
-            return false;
-          })
-          .then(function (ok) {
-            setBusy(false);
-            return ok;
-          });
+    // Paint first, send after: the rows land where the click asked for them in
+    // the same frame, and the PUT is what catches up behind them.
+    const save = useCallback(
+      function (next, opts) {
+        const target = { ...next };
+        if (!(opts && opts.reload === false)) threadsStale.current = true;
+        paint(target);
+        pending.current = target;
+        return flush();
       },
-      [busy],
+      [flush, paint],
     );
 
     const createTopic = function () {
       const name = newName.trim();
       const id = newId.trim();
+      const current = stateRef.current;
       // The id is the locked prefix plus the user's suffix; a bare t_ is not an id.
-      if (!name || id.length <= ID_PREFIX.length || !state || busy) return;
-      run(function () {
-        const entry = { id: id, name: name };
-        return save({ ...state, entries: state.entries.concat([entry]) });
-      }).then(function (ok) {
+      if (!name || id.length <= ID_PREFIX.length || !current) return;
+      // A repeat click reads the painted registry, so a double add cannot mint
+      // the same id twice.
+      if (topicIdProblem(id, current.entries)) return;
+      const entry = { id: id, name: name };
+      save({ ...current, entries: current.entries.concat([entry]) }).then(function (ok) {
         if (ok) {
           setNewName("");
           setNewId(ID_PREFIX);
@@ -610,35 +642,32 @@
 
     const renameTopic = function (id, name) {
       const trimmed = (name || "").trim();
-      if (!trimmed || !state) return;
-      run(function () {
-        return save({
-          ...state,
-          entries: state.entries.map(function (e) {
-            return e.id === id ? entryNamed(e, trimmed) : e;
-          }),
-        });
+      const current = stateRef.current;
+      if (!trimmed || !current) return;
+      save({
+        ...current,
+        entries: current.entries.map(function (entry) {
+          return entry.id === id ? entryNamed(entry, trimmed) : entry;
+        }),
       }).then(function (ok) {
         if (ok) setEditing(null);
       });
     };
 
     const setHome = function (id) {
-      if (!state) return;
-      run(function () {
-        return save({ ...state, home_id: id });
-      });
+      const current = stateRef.current;
+      if (!current) return;
+      return save({ ...current, home_id: id });
     };
 
     const toggleArchive = function (topic) {
-      if (!state) return;
-      run(function () {
-        return save({
-          ...state,
-          entries: state.entries.map(function (e) {
-            return e.id === topic.id ? entryArchived(e, !e.archived) : e;
-          }),
-        });
+      const current = stateRef.current;
+      if (!current) return;
+      return save({
+        ...current,
+        entries: current.entries.map(function (entry) {
+          return entry.id === topic.id ? entryArchived(entry, !entry.archived) : entry;
+        }),
       });
     };
 
@@ -650,39 +679,41 @@
             '"' +
             topic.name +
             '" leaves the registry and sessions grouped under it become untagged' +
-            (state && state.home_id === topic.id
+            (stateRef.current && stateRef.current.home_id === topic.id
               ? ". It is the current home, so the home moves to another topic"
               : "") +
             ".",
           confirmLabel: "Delete",
         })
         .then(function (ok) {
-          if (!ok || !state) return;
-          const entries = state.entries.filter(function (e) {
-            return e.id !== topic.id;
+          const current = stateRef.current;
+          if (!ok || !current) return;
+          const entries = current.entries.filter(function (entry) {
+            return entry.id !== topic.id;
           });
-          const next = { ...state, entries: entries };
-          if (state.home_id === topic.id) next.home_id = fallbackHome(entries);
-          run(function () {
-            return save(next);
-          });
+          const next = { ...current, entries: entries };
+          if (current.home_id === topic.id) next.home_id = fallbackHome(entries);
+          return save(next);
         });
     };
 
+    // A reorder is optimistic: the rows swap in the click's own frame and the
+    // PUT follows in the background. Nothing disables while it runs, so rapid
+    // clicks chain on the painted order and only the last one hits the wire
+    // twice - the queue's newest-wins rule collapses the rest.
     const moveTopic = function (id, dir) {
-      if (!state) return;
-      const index = state.entries.findIndex(function (e) {
-        return e.id === id;
+      const current = stateRef.current;
+      if (!current) return;
+      const index = current.entries.findIndex(function (entry) {
+        return entry.id === id;
       });
       const target = index + dir;
-      if (index < 0 || target < 0 || target >= state.entries.length) return;
-      const entries = state.entries.slice();
+      if (index < 0 || target < 0 || target >= current.entries.length) return;
+      const entries = current.entries.slice();
       const moved = entries[index];
       entries[index] = entries[target];
       entries[target] = moved;
-      run(function () {
-        return save({ ...state, entries: entries });
-      });
+      return save({ ...current, entries: entries }, { reload: false });
     };
 
     const groups = useMemo(
@@ -755,7 +786,6 @@
               maxLength: 120,
               className: "h-8 w-64",
               "aria-label": "New topic name",
-              disabled: busy,
               onChange: function (e) {
                 setNewName(e.target.value);
               },
@@ -768,7 +798,6 @@
               maxLength: 64,
               className: "h-8 w-48",
               "aria-label": "New topic id",
-              disabled: busy,
               onChange: function (e) {
                 // Lock the t_ prefix
                 const raw = e.target.value;
@@ -785,7 +814,7 @@
               Button,
               {
                 size: "sm",
-                disabled: busy || !newName.trim() || !idSuffix || !!idProblem,
+                disabled: !newName.trim() || !idSuffix || !!idProblem,
                 onClick: createTopic,
               },
               "Add topic",
@@ -795,7 +824,7 @@
               {
                 size: "sm",
                 ghost: true,
-                disabled: loading || busy,
+                disabled: loading,
                 onClick: function () {
                   load();
                 },
@@ -826,7 +855,6 @@
                     threadCount: (groups.byTopic[topic.id] || []).length,
                     editing: !!(editing && editing.id === topic.id),
                     draftName: editing && editing.id === topic.id ? editing.name : topic.name,
-                    busy: busy,
                     onDraftChange: function (name) {
                       setEditing({ id: topic.id, name: name });
                     },
