@@ -45,7 +45,7 @@ import {
   useQueryClient,
   useValue,
 } from "@hermes/plugin-sdk";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { jsx, jsxs } from "react/jsx-runtime";
 
 // Threads a topic section shows when expanded, and one page of a topic tab
@@ -779,7 +779,7 @@ async function fileThread(sessionId, topicId, topicName) {
         return;
       }
       if (!isMissingSession(error)) {
-        host.notifyError(error, `Could not file the new thread under ${topicName || "its topic"}`);
+        console.warn("[topoi] could not file the new thread under", topicName || "its topic");
         return;
       }
       const now = Date.now();
@@ -1280,6 +1280,13 @@ function TopicsSettings() {
   const [newId, setNewId] = useState("t_");
   const [renames, setRenames] = useState({});
   const [pendingDelete, setPendingDelete] = useState(null);
+  // Whole-state, last-writer-wins registry writes, painted before they are sent:
+  // one write is on the wire at a time and the newest request wins, so a burst of
+  // moves can never interleave two writes. `confirmed` is the last registry the
+  // server stored and the revert target; `pending` the newest unsent request.
+  const confirmed = useRef(null);
+  const pending = useRef(null);
+  const draining = useRef(null);
 
   const entries = data?.entries ?? [];
   const homeId = data?.home_id;
@@ -1293,18 +1300,64 @@ function TopicsSettings() {
   const idSuffix = newId.startsWith(ID_PREFIX) ? newId.slice(ID_PREFIX.length) : "";
   const idProblem = idSuffix ? topicIdProblem(newId, entries) : "";
 
-  const save = async (next) => {
-    try {
-      await putTopics({
-        entries: next.entries ?? entries,
-        home_id: next.home_id ?? homeId,
-      });
-    } catch (err) {
-      host.notifyError(err, "Could not save topics");
-      return false;
-    }
-    qc.invalidateQueries({ queryKey: ["topoi"] });
-    return true;
+  // The server's own copy is the revert target: the query's own answers seed it,
+  // and a successful write while nothing is queued keeps it current.
+  useEffect(() => {
+    if (data && !pending.current && !draining.current) confirmed.current = data;
+  }, [data]);
+
+  // The registry as the cache holds it, which is what a click builds on: the
+  // optimistic paint lands there first, so two clicks in one frame still chain.
+  const registry = () => qc.getQueryData(TOPICS_KEY(scope)) ?? { entries, home_id: homeId };
+
+  const paint = (next) => qc.setQueryData(TOPICS_KEY(scope), next);
+
+  // The write loop. A refused write drops the queue and puts the page back on the
+  // last registry the server confirmed, so the order the user saw reverted and the
+  // toast carries the reason.
+  const flush = () => {
+    if (draining.current) return draining.current;
+    const task = (async () => {
+      let failed = false;
+      try {
+        while (pending.current) {
+          const { label, payload } = pending.current;
+          pending.current = null;
+          try {
+            const stored = await putTopics(payload);
+            confirmed.current = stored ?? payload;
+            // A newer click already painted its own order: keep it.
+            if (!pending.current) paint(confirmed.current);
+          } catch (err) {
+            failed = true;
+            pending.current = null;
+            host.notifyError(err, label);
+            if (confirmed.current) paint(confirmed.current);
+          }
+        }
+      } finally {
+        draining.current = null;
+      }
+      // Threads and topic tabs come from the same writes (a delete prunes its
+      // bindings, archive drops a listing), so one refetch closes the round.
+      if (!failed) qc.invalidateQueries({ queryKey: ["topoi"] });
+      return !failed;
+    })();
+    draining.current = task;
+    return task;
+  };
+
+  // Paint first, send after: the rows land where the click asked for them in the
+  // same frame, and the PUT is what catches up behind them.
+  const save = (next, label = "Could not save topics") => {
+    const current = registry();
+    const target = {
+      entries: next.entries ?? current.entries ?? [],
+      home_id: next.home_id ?? current.home_id,
+    };
+    paint(target);
+    pending.current = { label, payload: target };
+    return flush();
   };
 
   const addTopic = () => {
@@ -1314,7 +1367,7 @@ function TopicsSettings() {
     if (!name || id.length <= ID_PREFIX.length || topicIdProblem(id, entries)) return;
     setNewName("");
     setNewId(ID_PREFIX);
-    return save({ entries: [...entries, { id, name }] });
+    return save({ entries: [...(registry().entries ?? []), { id, name }] });
   };
 
   const commitRename = (id) => {
@@ -1326,16 +1379,17 @@ function TopicsSettings() {
       delete next[id];
       return next;
     });
-    const entry = entries.find((item) => item.id === id);
+    const list = registry().entries ?? [];
+    const entry = list.find((item) => item.id === id);
     if (entry && entry.name === name) return;
     return save({
-      entries: entries.map((item) => (item.id === id ? { ...item, name } : item)),
+      entries: list.map((item) => (item.id === id ? { ...item, name } : item)),
     });
   };
 
   const toggleArchive = (id) =>
     save({
-      entries: entries.map((item) => {
+      entries: (registry().entries ?? []).map((item) => {
         if (item.id !== id) return item;
         const next = { ...item };
         if (next.archived) {
@@ -1349,18 +1403,21 @@ function TopicsSettings() {
 
   const setHome = (id) => save({ home_id: id });
 
+  // A reorder is optimistic: the rows swap in the click's own frame and the PUT
+  // follows in the background, so rapid clicks chain on the painted order.
   const move = (id, direction) => {
-    const index = entries.findIndex((item) => item.id === id);
+    const list = registry().entries ?? [];
+    const index = list.findIndex((item) => item.id === id);
     const target = index + direction;
-    if (index < 0 || target < 0 || target >= entries.length) return;
-    const next = [...entries];
+    if (index < 0 || target < 0 || target >= list.length) return;
+    const next = [...list];
     const [item] = next.splice(index, 1);
     next.splice(target, 0, item);
-    return save({ entries: next });
+    return save({ entries: next }, "Could not reorder topics");
   };
 
   const removeTopic = async (entry) => {
-    const remaining = entries.filter((item) => item.id !== entry.id);
+    const remaining = (registry().entries ?? []).filter((item) => item.id !== entry.id);
     const next = { entries: remaining };
     // A deleted home must not leave home_id pointing at a topic no client shows.
     if (homeId === entry.id) next.home_id = fallbackHome(remaining);
