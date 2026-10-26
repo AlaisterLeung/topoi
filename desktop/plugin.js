@@ -10,9 +10,12 @@
 // into ctx.storage, so an app restart or a plugin reload restores it; the
 // bind waits out the session row's lazy write, and it only ever files a
 // chat that did not exist when the arm was set - the topic tab's Add to
-// topic action files an existing chat that flow missed. The row menu's
-// Move to topic re-files a thread under another topic, the same bind with a
-// new target.
+// topic action files an existing chat that flow missed. A click made while a
+// chat with no turns is on screen ADOPTS that chat instead (the strip's "+"
+// mints exactly such a chat), so the new thread lands in the tab the user is
+// looking at rather than replacing the main pane. The row menu's Move to
+// topic re-files a thread under another topic, the same bind with a new
+// target.
 //
 // Disk plugin: plain ESM, no build, no JSX (jsx() calls only), and the import
 // allowlist is @hermes/plugin-sdk / react / react/jsx-runtime.
@@ -204,9 +207,10 @@ const NO_TAB = atom(false);
 const paneTab = (paneId) =>
   typeof host.paneVisibility === "function" ? host.paneVisibility(paneId) : NO_TAB;
 const paneTabsReadable = () => typeof host.paneVisibility === "function";
-// The armed New thread filing, if any: the topic to file under plus the chat
-// id that was focused when the click happened (never the one we want). An
-// atom so the composer banner re-renders when the arm changes.
+// The armed New thread filing, if any: the topic to file under, the chat id
+// that was focused when the click happened (never the one we want), and - when
+// the click adopted a tab with no turns yet - that tab's own id, which IS the
+// chat to file. An atom so the composer banner re-renders when the arm changes.
 const $pendingThread = atom(null);
 
 // The atom is the live copy and ctx.storage the durable mirror, so an app
@@ -219,6 +223,7 @@ const setPendingThread = (next) => {
       at: next.at,
       known: next.known ? [...next.known] : null,
       seenId: next.seenId,
+      sessionId: next.sessionId ?? null,
       topicId: next.topicId,
       topicName: next.topicName,
     });
@@ -227,19 +232,46 @@ const setPendingThread = (next) => {
   }
 };
 
+// Files an adopted tab: the chat is already on screen, so the wait starts at
+// once and rides fileThread's row-write retry, and the note clears only while
+// it is still THIS chat's, so a newer New thread click is never cancelled by a
+// wait left over from the previous one.
+function fileAdoptedTab(sessionId, topicId, topicName) {
+  const stillWanted = () => {
+    const pending = $pendingThread.get();
+    return pending?.sessionId === sessionId && pending?.topicId === topicId;
+  };
+  void fileThread(sessionId, topicId, topicName, stillWanted).finally(() => {
+    const pending = $pendingThread.get();
+    if (pending?.sessionId === sessionId) {
+      setPendingThread(null);
+    }
+  });
+}
+
 // Restores an arm a previous session persisted and refreshes its snapshot,
-// so chats minted during the gap still cannot consume the arm.
+// so chats minted during the gap still cannot consume the arm. An adopted tab's
+// id is already known, so its filing simply resumes.
 function restorePendingThread() {
   const stored = storage?.get(PENDING_THREAD_KEY, null);
   if (!stored || typeof stored.topicId !== "string" || !stored.topicId) return;
   const at = typeof stored.at === "number" ? stored.at : Date.now();
+  const sessionId =
+    typeof stored.sessionId === "string" && stored.sessionId ? stored.sessionId : null;
+  const topicName =
+    typeof stored.topicName === "string" ? stored.topicName : stored.topicId;
   setPendingThread({
     at,
     known: Array.isArray(stored.known) ? new Set(stored.known) : null,
     seenId: typeof stored.seenId === "string" ? stored.seenId : null,
+    sessionId,
     topicId: stored.topicId,
-    topicName: typeof stored.topicName === "string" ? stored.topicName : stored.topicId,
+    topicName,
   });
+  if (sessionId) {
+    fileAdoptedTab(sessionId, stored.topicId, topicName);
+    return;
+  }
   void knownSessionIds().then((known) => {
     const pending = $pendingThread.get();
     if (pending && known && pending.at === at) {
@@ -509,9 +541,10 @@ function TopicView({ topicId }) {
   const unfiledQuery = useQuery({
     enabled: picking,
     queryFn: async () => {
-      const profile = activeProfile();
+      // `limit` caps at 200 in the gateway's list_sessions (1..200, anything
+      // else is invalid_params), so the picker's old 500 listed nothing.
       const [listed, filed] = await Promise.all([
-        host.request("session.list", { limit: 500, ...(profile ? { profile } : {}) }),
+        host.request("session.list", { limit: 200 }),
         fetchThreads(),
       ]);
       const filedIds = new Set();
@@ -573,7 +606,7 @@ function TopicView({ topicId }) {
             children: [
               jsxs(Button, {
                 className: "topoi-new-thread",
-                onClick: () => startNewThread(entry ?? { id: topicId, name }),
+                onClick: () => void startNewThread(entry ?? { id: topicId, name }),
                 size: "sm",
                 children: [jsx(Codicon, { name: "add", size: "0.75rem" }), "New thread"],
               }),
@@ -722,36 +755,136 @@ function openTopicTab(entry) {
 // NOT exist when it was set, so a click on another chat inside the window
 // cannot be filed instead of the new one. A failed listing leaves the
 // snapshot unknown and the arm keeps its old behaviour (file the next
-// unseen id) rather than never filing at all.
+// unseen id) rather than never filing at all. `limit` caps at 200: the
+// gateway's list_sessions accepts 1..200 and refuses anything else, so the old
+// `limit: 500` made every snapshot fail and left the guard blind in the app.
 const knownSessionIds = async () => {
   try {
-    const profile = activeProfile();
-    const listed = await host.request("session.list", {
-      limit: 500,
-      ...(profile ? { profile } : {}),
-    });
+    const listed = await host.request("session.list", { limit: 200 });
     return new Set((listed?.sessions ?? []).map((row) => row?.id).filter(Boolean));
   } catch {
     return null;
   }
 };
 
-// The app mints a session on the first prompt, so the click arms a filing and
-// the new stored id that shows up next is the chat to file. Opening the
-// fresh session as a tab itself is not possible from a plugin, so the draft
-// lands in the main pane - where the ArmBanner above the composer names the
-// topic it will be filed under.
-function startNewThread(entry) {
+// Turns a chat already has, or null when NO listing names it. The app writes a
+// session row only when the first prompt is processed, so a chat missing from
+// both the live listing and core's persisted read (state.db, no message floor)
+// has no turns: it is the draft a New session tab holds before its first send.
+const foundRow = (rows, sessionId) =>
+  (Array.isArray(rows) ? rows : []).find(
+    (row) => row?.id === sessionId || row?.session_id === sessionId,
+  ) ?? null;
+
+async function chatTurnCount(sessionId) {
+  try {
+    const live = await host.request("session.list", { limit: 200 });
+    const row = foundRow(live?.sessions, sessionId);
+    if (row) return Number(row.message_count ?? 0) || 0;
+  } catch {
+    // Refused or socket-busy: the persisted read below still answers.
+  }
+  if (typeof host.listPersistedSessions !== "function") return null;
+  try {
+    const page = await host.listPersistedSessions(null, {
+      limit: 50,
+      profile: activeProfile() || "default",
+    });
+    const row = foundRow(page?.sessions, sessionId);
+    if (row) return Number(row.message_count ?? 0) || 0;
+  } catch {
+    // Unreadable: stay unknown, and the click adopts the chat it is looking at.
+  }
+  return null;
+}
+
+// Core's tab-strip "+" (the same action as ⌘T). Pressing it is the only
+// plugin-side door to a WORKING fresh chat tab: the app mints the session, docks
+// the tile and patches the runtime id into it, and that patch has no SDK door -
+// a plugin that mints its own session and calls host.openSession('tab') leaves
+// the tile hydrating a row that does not exist yet, which latches "Session
+// unavailable". Core chrome is not a plugin surface, so every step below is by
+// DOM shape and any miss returns false, where the caller keeps the app's own
+// new-chat draft. The shapes: a strip carries `data-zone-tabstrip`, its tabs
+// `data-tree-tab` (`workspace`, or `session-tile:<stored id>`), and the chat
+// strip's glyph is the one button in that strip wrapping an `i.codicon-add`.
+const stripTabIds = (strip) =>
+  [...strip.querySelectorAll("[data-tree-tab]")].map(
+    (tab) => tab.getAttribute("data-tree-tab") ?? "",
+  );
+
+const isChatStrip = (strip) =>
+  stripTabIds(strip).some(
+    (paneId) => paneId === "workspace" || paneId.startsWith("session-tile:"),
+  );
+
+const stripAddButton = (strip) =>
+  [...strip.querySelectorAll("button")].find((button) =>
+    button.querySelector("i.codicon-add"),
+  ) ?? null;
+
+function pressNewChatTab() {
+  if (typeof document === "undefined") return false;
+  const strips = [...document.querySelectorAll("[data-zone-tabstrip]")].filter(isChatStrip);
+  if (strips.length === 0) return false;
+  // A split holds several chat strips: the one carrying the focused chat's tab
+  // answers, else the first. The press itself is what aims core at that zone.
+  const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
+  const strip =
+    strips.find((candidate) =>
+      stripTabIds(candidate).includes(`session-tile:${focused}`),
+    ) ?? strips[0];
+  const button = stripAddButton(strip);
+  if (!button) return false;
+  // pointerdown FIRST: the wrapper's capture handler is what tells core which
+  // zone the new tab belongs to, and the button's own handler stops the event
+  // before the strip's drag logic sees it.
+  try {
+    const Press = globalThis.PointerEvent ?? globalThis.MouseEvent;
+    button.dispatchEvent(
+      new Press("pointerdown", { bubbles: true, button: 0, buttons: 1, cancelable: true }),
+    );
+  } catch {
+    // A host without PointerEvent: the click still mints the tab.
+  }
+  button.click();
+  return true;
+}
+
+// A New thread click. A chat with no turns that is already ON SCREEN is the new
+// thread: the tab strip's "+" mints exactly such a chat, so minting another one
+// would leave the tab the user is looking at empty while the new thread landed
+// in the main pane. Adopting it keeps the tab where it is and files it on the
+// first send through fileThread's row-write retry. Every other click opens a tab
+// of its own by pressing core's own strip button.
+async function startNewThread(entry) {
   if (typeof host.newChat !== "function") {
     host.notify({ kind: "error", message: "Update Hermes Desktop to start a chat." });
     return;
   }
   const name = entry.name ?? entry.id;
   const at = Date.now();
+  const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
+  // Unknown counts as no turns: a chat no listing carries is a draft, and the
+  // filing's own row-write retry is what makes that guess safe.
+  if (focused && !(await chatTurnCount(focused))) {
+    setPendingThread({
+      at,
+      known: null,
+      seenId: focused,
+      sessionId: focused,
+      topicId: entry.id,
+      topicName: name,
+    });
+    host.composer?.focus?.(focused);
+    fileAdoptedTab(focused, entry.id, name);
+    return;
+  }
   setPendingThread({
     at,
     known: null,
-    seenId: host.state?.focusedStoredSessionId?.get?.() ?? null,
+    seenId: focused,
+    sessionId: null,
     topicId: entry.id,
     topicName: name,
   });
@@ -764,7 +897,12 @@ function startNewThread(entry) {
       setPendingThread({ ...pending, known });
     }
   });
-  host.newChat();
+  // A tab of its own when the click came from a real conversation: core's own
+  // strip button is pressed (it mints, docks and patches the runtime), and a
+  // desktop whose strip this plugin cannot find keeps the app's new-chat draft.
+  if (!pressNewChatTab()) {
+    host.newChat();
+  }
 }
 
 // The app writes the session row a moment after the first prompt, so a 404 is
@@ -788,11 +926,14 @@ const stillFocused = (sessionId) =>
 // no row (nobody sent into it), which is not a failure the user can act on, so
 // it drops silently. While that draft is still focused the wait continues
 // slowly until the hard cap, which is what keeps a long think before the first
-// send from losing the filing.
-async function fileThread(sessionId, topicId, topicName) {
+// send from losing the filing. `stillWanted` (optional) is the caller's
+// supersession test, read before every attempt: an adopted tab whose click has
+// since been replaced stops without binding.
+async function fileThread(sessionId, topicId, topicName, stillWanted = null) {
   const deadline = Date.now() + bindWindow("__TOPOI_BIND_GRACE_MS__", BIND_ROW_GRACE_MS);
   const cap = Date.now() + bindWindow("__TOPOI_BIND_MAX_MS__", BIND_ROW_MAX_MS);
   for (;;) {
+    if (stillWanted && !stillWanted()) return;
     try {
       await bindThread(sessionId, topicId);
       queryClient.invalidateQueries({ queryKey: ["topoi"] });
@@ -829,24 +970,35 @@ function watchNewThreads() {
   return focused.listen((sessionId) => {
     const pending = $pendingThread.get();
     if (!pending || !sessionId || sessionId === pending.seenId) return;
+    // An adopted tab names its own chat, so this door - which files the FIRST
+    // unseen id a draft produces - is not its filing. Without this guard a
+    // switch to any other chat filed THAT chat under the topic (and left the
+    // adopted tab's own send unfiled).
+    if (pending.sessionId) return;
     // A chat that already existed when the arm was set is the user visiting
     // another chat, not the new one: it must not consume the arm.
     if (pending.known?.has(sessionId)) return;
-    setPendingThread(null);
-    fileThread(sessionId, pending.topicId, pending.topicName);
+    // The chat the app just minted IS the new thread: adopt it, so the note
+    // follows it into its new tab and its filing waits for the row write the
+    // same way an adopted tab's does.
+    setPendingThread({ ...pending, sessionId, seenId: sessionId });
+    fileAdoptedTab(sessionId, pending.topicId, pending.topicName);
   });
 }
 
 // ---- the pane ----------------------------------------------------------------
 
 // While a New thread click is armed, the composer's top strip names the topic
-// the next chat will be filed under: the draft itself (in the main pane)
-// carries no such mark. Renders only on the fresh draft (no focused stored
-// session), so it never follows the user into an existing chat.
+// the chat will be filed under: the chat itself carries no such mark. An adopted
+// draft tab shows it while IT is the focused chat; the main-pane draft shows it
+// while nothing is focused, so it never follows the user into another chat.
 function ArmBanner() {
   const pending = useValue($pendingThread);
   const focused = useValue(host.state.focusedStoredSessionId);
-  if (!pending || focused != null) {
+  const onTarget = pending?.sessionId
+    ? focused === pending.sessionId
+    : focused == null;
+  if (!pending || !onTarget) {
     return null;
   }
   return jsxs("div", {
@@ -1182,7 +1334,7 @@ function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
       jsx("button", {
         "aria-label": `New thread in ${entry?.name ?? entry?.id}`,
         className: "topoi-section-add",
-        onClick: () => startNewThread(entry),
+        onClick: () => void startNewThread(entry),
         title: "New thread",
         type: "button",
         children: jsx(Codicon, { name: "add", size: "0.75rem" }),
