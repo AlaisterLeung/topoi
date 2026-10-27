@@ -10,12 +10,12 @@
 // into ctx.storage, so an app restart or a plugin reload restores it; the
 // bind waits out the session row's lazy write, and it only ever files a
 // chat that did not exist when the arm was set - the topic tab's Add to
-// topic action files an existing chat that flow missed. A click made while a
-// chat with no turns is on screen ADOPTS that chat instead (the strip's "+"
-// mints exactly such a chat), so the new thread lands in the tab the user is
-// looking at rather than replacing the main pane. The row menu's Move to
-// topic re-files a thread under another topic, the same bind with a new
-// target.
+// topic action files an existing chat that flow missed. A click made while
+// ANY open tab holds a chat with no turns ADOPTS that chat (the strip's "+"
+// mints exactly such a chat, and so does the primary pane's empty draft), so
+// the new thread lands in an empty tab the user already has instead of
+// stacking another one. The row menu's Move to topic re-files a thread under
+// another topic, the same bind with a new target.
 //
 // Disk plugin: plain ESM, no build, no JSX (jsx() calls only), and the import
 // allowlist is @hermes/plugin-sdk / react / react/jsx-runtime.
@@ -767,36 +767,54 @@ const knownSessionIds = async () => {
   }
 };
 
-// Turns a chat already has, or null when NO listing names it. The app writes a
-// session row only when the first prompt is processed, so a chat missing from
-// both the live listing and core's persisted read (state.db, no message floor)
-// has no turns: it is the draft a New session tab holds before its first send.
-const foundRow = (rows, sessionId) =>
-  (Array.isArray(rows) ? rows : []).find(
-    (row) => row?.id === sessionId || row?.session_id === sessionId,
-  ) ?? null;
-
-async function chatTurnCount(sessionId) {
+// One snapshot of both turn listings: the gateway's live `session.list` and
+// core's own persisted read (state.db, no message floor). `turns(id)` answers a
+// chat's message count, or null when neither listing names it - the app writes
+// a session row only when the first prompt is processed, so an unstarted "New
+// session" tab is rowless and appears in neither. `answered` says whether any
+// listing answered at all, so "no turns" can be told from "could not look".
+async function loadTurnLookup() {
+  const rows = new Map();
+  let answered = false;
+  const absorb = (page) => {
+    for (const row of Array.isArray(page?.sessions) ? page.sessions : []) {
+      const id = row?.id ?? row?.session_id;
+      if (id && !rows.has(id)) rows.set(id, Number(row.message_count ?? 0) || 0);
+    }
+  };
   try {
-    const live = await host.request("session.list", { limit: 200 });
-    const row = foundRow(live?.sessions, sessionId);
-    if (row) return Number(row.message_count ?? 0) || 0;
+    absorb(await host.request("session.list", { limit: 200 }));
+    answered = true;
   } catch {
     // Refused or socket-busy: the persisted read below still answers.
   }
-  if (typeof host.listPersistedSessions !== "function") return null;
-  try {
-    const page = await host.listPersistedSessions(null, {
-      limit: 50,
-      profile: activeProfile() || "default",
-    });
-    const row = foundRow(page?.sessions, sessionId);
-    if (row) return Number(row.message_count ?? 0) || 0;
-  } catch {
-    // Unreadable: stay unknown, and the click adopts the chat it is looking at.
+  if (typeof host.listPersistedSessions === "function") {
+    try {
+      absorb(
+        await host.listPersistedSessions(null, {
+          limit: 50,
+          profile: activeProfile() || "default",
+        }),
+      );
+      answered = true;
+    } catch {
+      // Unreadable: the snapshot stays partial, and nothing is assumed from it.
+    }
   }
-  return null;
+  return { answered, turns: (id) => (rows.has(id) ? rows.get(id) : null) };
 }
+
+// Is this chat unstarted? A listed chat answers from its own message count, and
+// a chat NO answering listing names has no row yet, so it has no turns either.
+// `trustUnreadable` is the focused chat's benefit of the doubt: an unreadable
+// listing still lets the click adopt it, because the filing's own row-write
+// retry is what makes that guess safe. Another tab has to prove it is empty, so
+// a failed listing can never hand a real conversation to the filing.
+const isUnstarted = (lookup, sessionId, trustUnreadable = false) => {
+  const turns = lookup.turns(sessionId);
+  if (turns !== null) return turns === 0;
+  return lookup.answered || trustUnreadable;
+};
 
 // Core's tab-strip "+" (the same action as ⌘T). Pressing it is the only
 // plugin-side door to a WORKING fresh chat tab: the app mints the session, docks
@@ -813,9 +831,13 @@ const stripTabIds = (strip) =>
     (tab) => tab.getAttribute("data-tree-tab") ?? "",
   );
 
+// Core's chat panes: `workspace` is the primary chat, `session-tile:<stored id>`
+// is one chat's own tab. Every other pane id in a strip is chrome.
+const TILE_PANE_PREFIX = "session-tile:";
+
 const isChatStrip = (strip) =>
   stripTabIds(strip).some(
-    (paneId) => paneId === "workspace" || paneId.startsWith("session-tile:"),
+    (paneId) => paneId === "workspace" || paneId.startsWith(TILE_PANE_PREFIX),
   );
 
 const stripAddButton = (strip) =>
@@ -832,7 +854,7 @@ function pressNewChatTab() {
   const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
   const strip =
     strips.find((candidate) =>
-      stripTabIds(candidate).includes(`session-tile:${focused}`),
+      stripTabIds(candidate).includes(`${TILE_PANE_PREFIX}${focused}`),
     ) ?? strips[0];
   const button = stripAddButton(strip);
   if (!button) return false;
@@ -851,12 +873,112 @@ function pressNewChatTab() {
   return true;
 }
 
-// A New thread click. A chat with no turns that is already ON SCREEN is the new
-// thread: the tab strip's "+" mints exactly such a chat, so minting another one
-// would leave the tab the user is looking at empty while the new thread landed
-// in the main pane. Adopting it keeps the tab where it is and files it on the
-// first send through fileThread's row-write retry. Every other click opens a tab
-// of its own by pressing core's own strip button.
+// Every chat tab the app has open, by stored id, read off the strips' own tab
+// elements. The primary chat is a `workspace` pane with no stored id of its own,
+// so it is answered by primaryDraftOnScreen instead.
+function openChatTabIds() {
+  if (typeof document === "undefined") return [];
+  const ids = [];
+  for (const strip of document.querySelectorAll("[data-zone-tabstrip]")) {
+    if (!isChatStrip(strip)) continue;
+    for (const paneId of stripTabIds(strip)) {
+      if (!paneId.startsWith(TILE_PANE_PREFIX)) continue;
+      const sessionId = paneId.slice(TILE_PANE_PREFIX.length);
+      if (sessionId && !ids.includes(sessionId)) ids.push(sessionId);
+    }
+  }
+  return ids;
+}
+
+// Fronts an already-open chat tab. The press is core's own tab activation
+// (pointerdown first, the same capture-phase zone note the strip "+" needs), and
+// `host.openSession` is the fallback for a desktop whose tab elements this plugin
+// cannot find - `intent: 'tab'` fronts an OPEN tile, and only an unopened id
+// would hydrate over REST, which a rowless draft must never do.
+function frontChatTab(sessionId) {
+  const tab =
+    typeof document === "undefined"
+      ? null
+      : document.querySelector(
+          `[data-tree-tab="${TILE_PANE_PREFIX}${sessionId}"]`,
+        );
+  if (tab) {
+    try {
+      const Press = globalThis.PointerEvent ?? globalThis.MouseEvent;
+      tab.dispatchEvent(
+        new Press("pointerdown", { bubbles: true, button: 0, buttons: 1, cancelable: true }),
+      );
+    } catch {
+      // A host without PointerEvent: the click still fronts the tab.
+    }
+    tab.click();
+    return true;
+  }
+  const profile = activeProfile();
+  void host
+    .openSession(sessionId, { intent: "tab", ...(profile ? { profile } : {}) })
+    .catch(() => {});
+  return false;
+}
+
+// The primary chat holds an unstarted draft that is ON SCREEN: core reports no
+// selected session there (a null focused chat) and the pane owns its zone's
+// active slot, so the empty tab in front is the app's own new chat.
+function primaryDraftOnScreen(focused) {
+  if (focused) return false;
+  if (typeof host.paneVisibility !== "function") return false;
+  return host.paneVisibility("workspace")?.get?.() === true;
+}
+
+// Files the chat this click adopted. The arm carries the chat's own id, so the
+// focus watcher skips it and fileAdoptedTab owns the filing; a tab the user is
+// not looking at is fronted first, so the thread lands where they will type.
+function adoptChat(sessionId, entry, name, front) {
+  setPendingThread({
+    at: Date.now(),
+    known: null,
+    seenId: sessionId,
+    sessionId,
+    topicId: entry.id,
+    topicName: name,
+  });
+  if (front) frontChatTab(sessionId);
+  host.composer?.focus?.(sessionId);
+  fileAdoptedTab(sessionId, entry.id, name);
+}
+
+// Arms the primary pane's own unstarted draft: no tab is minted, so the thread
+// lands in the empty chat already on screen, and the watcher files the first id
+// that send produces (the snapshot keeps a visit to another chat from consuming
+// the arm).
+function adoptPrimaryDraft(entry, name) {
+  const at = Date.now();
+  setPendingThread({
+    at,
+    known: null,
+    seenId: null,
+    sessionId: null,
+    topicId: entry.id,
+    topicName: name,
+  });
+  void knownSessionIds().then((known) => {
+    const pending = $pendingThread.get();
+    if (pending && pending.at === at) {
+      setPendingThread({ ...pending, known });
+    }
+  });
+  host.composer?.focus?.("new");
+}
+
+// A New thread click. ANY open tab holding a chat with no turns IS the new
+// thread, whether it is the tab in front or one behind another (Boss,
+// 2026-10-27: "whether in front or not does not matter"): the click adopts it
+// and files it on the first send through fileThread's row-write retry, instead
+// of stacking a second empty tab. That covers the app's own "New session" tab -
+// the strip's "+" and ⌘T mint a chat with no turns - and the primary chat's
+// empty draft, which is the tab the app shows on start and after the last one
+// closes. Only a click made from a real conversation opens a tab of its own, by
+// pressing core's own strip button.
 async function startNewThread(entry) {
   if (typeof host.newChat !== "function") {
     host.notify({ kind: "error", message: "Update Hermes Desktop to start a chat." });
@@ -865,19 +987,20 @@ async function startNewThread(entry) {
   const name = entry.name ?? entry.id;
   const at = Date.now();
   const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
-  // Unknown counts as no turns: a chat no listing carries is a draft, and the
-  // filing's own row-write retry is what makes that guess safe.
-  if (focused && !(await chatTurnCount(focused))) {
-    setPendingThread({
-      at,
-      known: null,
-      seenId: focused,
-      sessionId: focused,
-      topicId: entry.id,
-      topicName: name,
-    });
-    host.composer?.focus?.(focused);
-    fileAdoptedTab(focused, entry.id, name);
+  const lookup = await loadTurnLookup();
+  if (focused && isUnstarted(lookup, focused, true)) {
+    adoptChat(focused, entry, name, false);
+    return;
+  }
+  for (const sessionId of openChatTabIds()) {
+    if (sessionId === focused) continue;
+    if (isUnstarted(lookup, sessionId)) {
+      adoptChat(sessionId, entry, name, true);
+      return;
+    }
+  }
+  if (primaryDraftOnScreen(focused)) {
+    adoptPrimaryDraft(entry, name);
     return;
   }
   setPendingThread({
