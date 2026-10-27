@@ -318,9 +318,8 @@ const fetchCronResult = (sessionId) =>
 const deleteThread = (sessionId) =>
   rest(`/threads/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 
-// The row's open door: a new tab / window / main on intent (the same
-// vocabulary middle-click and the session menu use). The sidebar pane always
-// passes "tab", so a row click never replaces the chat already open.
+// The sidebar pane passes "in-place".
+// The row menu and the branch keep asking for their own intents.
 const openThread = (thread, intent) => {
   if (thread && typeof thread === "object" && thread.cron_result) {
     openCronReader(thread);
@@ -1499,7 +1498,7 @@ function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle,
           jsx(ThreadRow, {
             entries,
             key: thread.lineage_root,
-            onOpen: (row) => openThread(row, "tab"),
+            onOpen: (row) => openThread(row, "in-place"),
             showStatus: true,
             thread,
           }),
