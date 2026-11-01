@@ -296,6 +296,35 @@ def main() -> int:
     check("check_requirements is unconditional", mod.check_requirements())
     check("register is callable", callable(mod.register))
 
+    class _RegisterCtx:
+        """The registrar seams register() touches: the platform and the bundled skills."""
+
+        def __init__(self) -> None:
+            self.platforms: list[str] = []
+            self.skills: list[tuple[str, str]] = []
+
+        def register_platform(self, **kwargs) -> None:
+            self.platforms.append(str(kwargs.get("name")))
+
+        def register_skill(self, name, path, description="", frontmatter=None) -> None:
+            self.skills.append((str(name), str(path)))
+
+    reg_ctx = _RegisterCtx()
+    mod.register(reg_ctx)
+    check(
+        "register installs the topoi platform",
+        reg_ctx.platforms == ["topoi"],
+        reg_ctx.platforms,
+    )
+    check(
+        "register bundles the cron-delivery skill",
+        any(
+            name == "cron-delivery" and pathlib.Path(path).is_file()
+            for name, path in reg_ctx.skills
+        ),
+        reg_ctx.skills,
+    )
+
     print()
     if failures:
         print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")

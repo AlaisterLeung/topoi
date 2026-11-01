@@ -13,6 +13,7 @@ import logging
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from gateway.config import HomeChannel, Platform, PlatformConfig
@@ -30,6 +31,15 @@ logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "topoi"
 DEFAULT_HOME_TOPIC = "t_system"
+
+# Bundled skills, registered read-only as ``topoi:<name>``. They load only when relevant, so an
+# agent scheduling a delivery reads the rule before picking a target, not after the topic stays empty.
+_SKILLS: dict[str, str] = {
+    "cron-delivery": (
+        "Use when a cron job must deliver into a topoi topic. Forces attach_to_session, then "
+        "verifies the seeded thread instead of the delivery ledger."
+    ),
+}
 
 # The thread id shape create_handoff_thread mints, so an explicit deliver target can name one.
 _THREAD_RE = re.compile(r"^th_\d+_[0-9a-f]{6}$")
@@ -230,3 +240,22 @@ def register(ctx) -> None:
         emoji="💬",
         pii_safe=True,
     )
+    _register_skills(ctx)
+
+
+def _register_skills(ctx) -> None:
+    """Hand every bundled ``skills/<name>/SKILL.md`` to the loader as ``topoi:<name>``."""
+    skills_dir = Path(__file__).parent / "skills"
+    for name, description in _SKILLS.items():
+        skill_md = skills_dir / name / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        try:
+            ctx.register_skill(
+                name=name,
+                path=skill_md,
+                description=description,
+                frontmatter={"name": name, "description": description},
+            )
+        except Exception:
+            logger.warning("[topoi] skill %s skipped", name, exc_info=True)
