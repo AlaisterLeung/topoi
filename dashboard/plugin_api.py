@@ -384,10 +384,12 @@ def _session_exists(db: Any):
 
 
 def _live_topic_ids() -> set[str]:
-    """The registry's live entry ids. A binding to a topic no client shows is worse than a refusal, so the write path checks liveness here."""
-    return {
-        str(entry.get("id")) for entry in topic_store.load_state().get("entries") or []
-    }
+    """The registry's live entry ids. A binding to a topic no client shows is worse than a refusal, so the write path checks liveness here.
+
+    Stays free of HTTP: an unreadable config raises ``TopicStoreUnavailable`` and the routes map it to 503, because ``_bind_core`` is driven by plain sync checks that must not import FastAPI.
+    """
+    state = topic_store.load_state()
+    return {str(entry.get("id")) for entry in state.get("entries") or []}
 
 
 def _prune_after_registry_write(state: dict[str, Any]) -> int:
@@ -470,19 +472,23 @@ def _bind_core(
 
 @router.get("/topics")
 async def get_topics() -> dict[str, Any]:
-    """The registry: ``entries`` (ordered) and ``home_id``. Bindings are server-side only: a thread's topic is resolved in ``GET /threads``, never shipped as a map."""
-    legacy = topic_store.legacy_bindings()
-    if legacy:
-        # One-time migration of a pre-store config-level bindings block; the next registry write replaces the whole block either way.
-        bindings.adopt_config_block(legacy)
-    return topic_store.load_state()
+    """The registry: ``entries`` (ordered) and ``home_id``. Bindings are server-side only: a thread's topic is resolved in ``GET /threads``, never shipped as a map.
+
+    An unreadable config is a 503, never a seed: this route is whole-state last-writer-wins, so a plausible default served here can be PUT straight back over the real registry.
+    """
+    try:
+        return topic_store.load_state()
+    except topic_store.TopicStoreUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.put("/topics")
 async def put_topics(body: dict[str, Any]) -> dict[str, Any]:
-    """Store a client-sent registry (whole-state, last writer wins) and return what was stored, stamped. 422 carries the refusal reason; a refused write leaves the stored block untouched."""
+    """Store a client-sent registry (whole-state, last writer wins) and return what was stored, stamped. 422 carries the refusal reason; a refused write leaves the stored block untouched. An unreadable config is a 503 with nothing written, the same contract as the read."""
     try:
         state = topic_store.write_state(body)
+    except topic_store.TopicStoreUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     except topic_store.TopicError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     _prune_after_registry_write(state)
@@ -650,7 +656,11 @@ async def get_threads(
     }
     db = _open_db(profile)
     try:
-        live = _live_topic_ids()
+        try:
+            live = _live_topic_ids()
+        except topic_store.TopicStoreUnavailable as error:
+            # The listing resolves every row through the live topic set, so an unreadable registry cannot answer at all: 503 rather than an empty list.
+            raise HTTPException(status_code=503, detail=str(error)) from error
         binding_map = bindings.mapping()
 
         def resolve_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -841,6 +851,8 @@ async def bind_thread(
     db = _open_db(profile)
     try:
         return _bind_core(db, session_id, topic_id, move=move)
+    except topic_store.TopicStoreUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except BindConflict as error:

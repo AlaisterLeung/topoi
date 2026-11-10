@@ -94,8 +94,8 @@ def main() -> int:
     check("an unset registry reads as no stored home", store.home_id() == "")
     check("an unset registry stores nothing", block() is None)
 
-    # The retired pre-rename shape (items / revision) is ignored, never half-read, and it says so in the log.
-    # A leftover deleted list rides the same rule: ignored on read, gone after the next write.
+    # An unknown shape is ignored, never half-read: only entries / updated_at are read.
+    # A stray deleted list rides the same rule: ignored on read, gone after the next write.
     raw = raw_config()
     raw["platforms"]["topoi"]["topics"] = {
         "revision": 23,
@@ -415,9 +415,10 @@ def main() -> int:
         (tolerant["home_id"], store.home_id()),
     )
 
-    # A pre-store bindings block in the config is not registry state: the registry read
-    # ignores it, legacy_bindings() surfaces it for one-time adoption, and any write
-    # replaces the whole block (so the key disappears without anyone touching it).
+    # A stray bindings key in the config is not registry state: the registry read
+    # ignores it, and any write replaces the whole block (so the key disappears
+    # without anyone touching it). The pre-store adoption path is gone, so nothing
+    # reads that key any more.
     raw = raw_config()
     raw["platforms"]["topoi"]["topics"]["bindings"] = {
         "20261009_030000_d4e5f6": "t_ok",
@@ -426,24 +427,42 @@ def main() -> int:
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     with_legacy = store.load_state()
     check(
-        "a legacy bindings block does not leak into the registry read",
+        "a stray bindings block does not leak into the registry read",
         "bindings" not in with_legacy
         and with_legacy["entries"] == [{"id": "t_ok", "name": "t_ok"}],
         with_legacy,
-    )
-    check(
-        "legacy_bindings surfaces the block for adoption",
-        dict(store.legacy_bindings())
-        == {"20261009_030000_d4e5f6": "t_ok", "bad id": "t_ok"},
-        dict(store.legacy_bindings()),
     )
     rewritten = store.write_state(
         {"home_id": "t_ok", "entries": [{"id": "t_ok", "name": "OK"}]}
     )
     check(
-        "a registry write drops the legacy bindings key from the block",
+        "a registry write drops the stray bindings key from the block",
         "bindings" not in (block() or {}) and rewritten["entries"][0]["name"] == "OK",
         block(),
+    )
+
+    # A config read failure must raise, and specifically not a TopicError: `/topics` is whole-state last-writer-wins, so a plausible default GET can be PUT straight back over the real registry, and a TopicError maps to 422 ("your request was wrong") rather than a retryable 503.
+    import hermes_cli.config as core_config
+
+    real_reader = core_config.load_config_readonly
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("config unreadable")
+
+    core_config.load_config_readonly = boom
+    try:
+        try:
+            store.load_state()
+            raised = None
+        except store.TopicStoreUnavailable as error:
+            raised = error
+    finally:
+        core_config.load_config_readonly = real_reader
+    check(
+        "an unreadable config raises instead of serving a seed",
+        isinstance(raised, store.TopicStoreUnavailable)
+        and not isinstance(raised, store.TopicError),
+        raised,
     )
 
     if failures:

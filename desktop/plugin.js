@@ -17,6 +17,10 @@
 // stacking another one. The row menu's Move to topic re-files a thread under
 // another topic, the same bind with a new target.
 //
+// A new chat is filed under the home topic by default, including one the app
+// minted without a click in this pane. The mechanics live in "the home default"
+// section below.
+//
 // Disk plugin: plain ESM, no build, no JSX (jsx() calls only), and the import
 // allowlist is @hermes/plugin-sdk / react / react/jsx-runtime.
 
@@ -42,6 +46,7 @@ import {
   PANES_AREA,
   ScrollArea,
   MessageTextContent,
+  SessionStatusDot,
   queryClient,
   coarseElapsed,
   useQuery,
@@ -51,12 +56,14 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { jsx, jsxs } from "react/jsx-runtime";
 
-// Threads a topic section shows when expanded, and one page of a topic tab
-// (its Load more button appends the next page of the same size).
-const PANE_THREADS = 4;
+// A topic section is a glance at recent activity: at most SECTION_THREADS
+// threads, and the head's label opens the topic tab for the full list.
+const SECTION_THREADS = 3;
+// One page of a topic tab: its Load more button appends the next page of the
+// same size.
 const PAGE_SIZE = 10;
 // A section lists only threads whose last activity is inside this window;
-// older ones are not rows, they fold into the section's "N more" count.
+// older ones are not rows here, they show only in the topic tab.
 const PANE_ACTIVE_DAYS = 7;
 const PANE_ACTIVE_MS = PANE_ACTIVE_DAYS * 24 * 60 * 60 * 1000;
 // A keystroke is not a query: the topic tab's search box waits out this gap, so
@@ -121,15 +128,8 @@ const CSS = `
 .topoi-reader-reply{color:var(--theme-neutral-chrome)}
 .topoi-row-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.75rem}
 .topoi-row-time{flex-shrink:0;font-size:0.625rem;color:var(--ui-text-quaternary)}
-.topoi-dot{flex-shrink:0;box-sizing:border-box;width:6px;height:6px;border-radius:9999px}
-.topoi-dot-working{background:var(--ui-accent)}
-.topoi-dot-stalled{border:1px solid var(--ui-accent)}
-.topoi-dot-unread{background:var(--ui-success)}
-.topoi-dot-attention{background:var(--color-amber-500)}
-.topoi-dot-background{border:1px solid var(--ui-text-tertiary)}
+.topoi-lead{display:grid;flex-shrink:0;place-items:center;width:14px;height:14px}
 .topoi-row-menu{padding:0 2px}
-.topoi-more{display:flex;align-items:center;height:24px;margin:0 8px;padding:0 4px;border:0;border-radius:4px;background:none;color:var(--ui-text-quaternary);font-size:0.6875rem;cursor:pointer}
-.topoi-more:hover{background:var(--chrome-action-hover);color:var(--ui-text-secondary)}
 .topoi-note{padding:4px 10px 8px;font-size:0.6875rem;line-height:1.5;color:var(--ui-text-quaternary)}
 .topoi-problem{font-size:0.6875rem;line-height:1.5;color:var(--color-red-400)}
 .topoi-tab{display:flex;flex-direction:column;height:100%;min-height:0}
@@ -148,15 +148,7 @@ const CSS = `
 .topoi-pick{display:flex;min-width:0;align-items:center;gap:8px;width:100%;height:26px;padding:0 4px;text-align:left;border:0;border-radius:4px;background:none;color:var(--ui-text-primary);font:inherit;cursor:pointer}
 .topoi-pick:hover{background:var(--chrome-action-hover)}
 .topoi-pick-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.75rem}
-/* The Add to topic toggle's active state: the ghost button keeps the hover
-   treatment while the picker is open, so the mode reads without a second
-   look. */
 .topoi-add-active{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
-/* The Button's default fill is bg-primary + text-primary-foreground, and a
-   skin's primaryForeground does not always contrast its primary (catppuccin
-   paints a light mauve primary with white ink, ~1.8:1). The theme's
-   mode-flipped chrome ink is the honest label colour here: near-black on the
-   light fills dark skins use, near-white on the deep fills light skins use. */
 .topoi-new-thread{color:var(--theme-neutral-chrome)}
 .topoi-settings{display:flex;flex-direction:column;gap:10px;padding:2px 0 8px}
 .topoi-add{display:flex;gap:6px}
@@ -213,6 +205,15 @@ const paneTabsReadable = () => typeof host.paneVisibility === "function";
 // chat to file. An atom so the composer banner re-renders when the arm changes.
 const $pendingThread = atom(null);
 
+// Chats this plugin opened itself, by id: a branch, and every thread row this
+// pane opened. The home default reads focus, and both kinds focus an id nothing
+// has seen before, so without this the branch would be armed to home and bound
+// twice - once by branchThread and once by the default, where the second bind
+// 409s - and a clicked cron mirror would be filed under home. It grows with use
+// and is never pruned on purpose: the set is small, and a pruned id that came
+// back would misfile.
+const ownChatIds = new Set();
+
 // The atom is the live copy and ctx.storage the durable mirror, so an app
 // restart or a desktop-plugin reload inside the arm's life restores it
 // instead of losing the filing. Every mutation goes through here.
@@ -221,6 +222,8 @@ const setPendingThread = (next) => {
   if (next) {
     storage?.set(PENDING_THREAD_KEY, {
       at: next.at,
+      awaitTurn: next.awaitTurn === true,
+      home: next.home === true,
       known: next.known ? [...next.known] : null,
       seenId: next.seenId,
       sessionId: next.sessionId ?? null,
@@ -258,10 +261,11 @@ function restorePendingThread() {
   const at = typeof stored.at === "number" ? stored.at : Date.now();
   const sessionId =
     typeof stored.sessionId === "string" && stored.sessionId ? stored.sessionId : null;
-  const topicName =
-    typeof stored.topicName === "string" ? stored.topicName : stored.topicId;
+  const topicName = typeof stored.topicName === "string" ? stored.topicName : stored.topicId;
   setPendingThread({
     at,
+    awaitTurn: stored.awaitTurn === true,
+    home: stored.home === true,
     known: Array.isArray(stored.known) ? new Set(stored.known) : null,
     seenId: typeof stored.seenId === "string" ? stored.seenId : null,
     sessionId,
@@ -269,21 +273,83 @@ function restorePendingThread() {
     topicName,
   });
   if (sessionId) {
+    if (stored.awaitTurn === true) {
+      // A home arm restored mid-draft still binds nothing until the first turn,
+      // so the check runs now and the watcher's own signals carry it after. The
+      // declaration is hoisted, which is why this call site can precede it.
+      void settleHomeArm();
+      return;
+    }
     fileAdoptedTab(sessionId, stored.topicId, topicName);
     return;
   }
+  // A restored id-less arm only applies while the draft is fronted; a reload that
+  // landed on a real chat should not leave it hunting the next unseen id.
+  //
+  // The test runs on a 400ms timer instead of here: at register() the route and
+  // paneVisibility('workspace') are often not published yet, so a synchronous
+  // check would drop a good arm on the reload it exists to survive, and a send
+  // inside that gap would file nothing. 400ms is enough for the layout to publish
+  // and far too short for anyone to have typed. An id the arm's own snapshot
+  // cannot account for is exempt throughout: that is the send-preceded-the-reload
+  // mint, which the block below recovers.
+  const focusedAtRestore = host.state?.focusedStoredSessionId?.get?.() ?? null;
+  const maybeMint =
+    Boolean(focusedAtRestore) &&
+    Array.isArray(stored.known) &&
+    !stored.known.includes(focusedAtRestore);
+  if (
+    !sessionId &&
+    stored.home === true &&
+    stored.awaitTurn !== true &&
+    !maybeMint &&
+    !primaryDraftOnScreen(focusedAtRestore)
+  ) {
+    globalThis.setTimeout(() => {
+      const armed = $pendingThread.get();
+      if (!armed || armed.at !== at || armed.sessionId) return;
+      const focusedNow = host.state?.focusedStoredSessionId?.get?.() ?? null;
+      if (primaryDraftOnScreen(focusedNow)) return;
+      if (focusedNow && armed.known instanceof Set && !armed.known.has(focusedNow)) return;
+      setPendingThread(null);
+    }, 400);
+  }
+  // The usual shape of a home-draft arm: no id until the send. Re-derive the
+  // snapshot here, since watchNewThreads tests a mint against it.
   void knownSessionIds().then((known) => {
     const pending = $pendingThread.get();
-    if (pending && known && pending.at === at) {
-      setPendingThread({ ...pending, known });
+    if (!pending || !(known instanceof Set) || pending.at !== at) return;
+    const focusedNow = host.state?.focusedStoredSessionId?.get?.() ?? null;
+    // A reload can land after the send but before the bind: the arm still has no
+    // id, the mint is focused, and no further focus change will announce it. An id
+    // the snapshot does not hold is that mint. Same conversion as watchNewThreads:
+    // let the settle read turns instead of starting fileThread's window on a chat
+    // that may have no row yet.
+    if (focusedNow && !pending.sessionId && !known.has(focusedNow)) {
+      setPendingThread({
+        ...pending,
+        awaitTurn: true,
+        known,
+        sessionId: focusedNow,
+        seenId: focusedNow,
+      });
+      void settleHomeArm();
+      return;
     }
+    setPendingThread({ ...pending, known });
   });
 }
 
 const TOPICS_KEY = (scope) => ["topoi", "topics", scope];
 const THREADS_KEY = (scope) => ["topoi", "threads", scope];
-const TOPIC_PAGE_KEY = (scope, topicId, limit, query) =>
-  ["topoi", "topic", scope, topicId, limit, query];
+const TOPIC_PAGE_KEY = (scope, topicId, limit, query) => [
+  "topoi",
+  "topic",
+  scope,
+  topicId,
+  limit,
+  query,
+];
 
 // Queries are scoped by the active connection so a backend switch is a clean
 // cache miss (the kanban roster pattern).
@@ -313,8 +379,7 @@ const bindThread = (sessionId, topicId, move = false) =>
       ? { session_id: sessionId, topic_id: topicId, move: true }
       : { session_id: sessionId, topic_id: topicId },
   });
-const fetchCronResult = (sessionId) =>
-  rest(`/threads/${encodeURIComponent(sessionId)}/cron`);
+const fetchCronResult = (sessionId) => rest(`/threads/${encodeURIComponent(sessionId)}/cron`);
 const deleteThread = (sessionId) =>
   rest(`/threads/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 
@@ -325,9 +390,13 @@ const openThread = (thread, intent) => {
     openCronReader(thread);
     return;
   }
-  const sessionId =
-    typeof thread === "string" ? thread : thread?.session_id;
+  const sessionId = typeof thread === "string" ? thread : thread?.session_id;
   if (!sessionId) return;
+  // This pane opened it, so it is not a draft's mint. The listing check in
+  // watchNewThreads covers threads this plugin never touched, but it reads the
+  // query cache, which is cold until the pane mounts: this line is the
+  // deterministic half.
+  ownChatIds.add(sessionId);
   return host
     .openSession(sessionId, intent ? { intent } : {})
     .catch((error) => host.notifyError(error, "Could not open the thread"));
@@ -403,6 +472,9 @@ async function branchThread(thread) {
     if (!sessionId) {
       throw new Error("The gateway did not return a branch id");
     }
+    // This plugin's own chat, not a tab the user minted: the focus it causes
+    // below must not read as a fresh tab for the home default.
+    ownChatIds.add(sessionId);
     // A branch copies its parent's transcript, so its row is seeded and the
     // tab can hydrate it; only a branch of a never-sent chat would be lazy.
     await host.openSession(sessionId, { intent: "tab", ...(profile ? { profile } : {}) });
@@ -462,7 +534,7 @@ function topicIdProblem(id, entries) {
 function fallbackHome(entries) {
   const live = entries.filter((entry) => !entry.archived);
   const pool = live.length > 0 ? live : entries;
-  return pool.length > 0 ? pool[0].id : "t_system";
+  return pool.length > 0 ? pool[0].id : "t_general";
 }
 
 // Threads grouped by topic in registry order. The home topic is marked, not
@@ -840,9 +912,8 @@ const isChatStrip = (strip) =>
   );
 
 const stripAddButton = (strip) =>
-  [...strip.querySelectorAll("button")].find((button) =>
-    button.querySelector("i.codicon-add"),
-  ) ?? null;
+  [...strip.querySelectorAll("button")].find((button) => button.querySelector("i.codicon-add")) ??
+  null;
 
 function pressNewChatTab() {
   if (typeof document === "undefined") return false;
@@ -852,9 +923,8 @@ function pressNewChatTab() {
   // answers, else the first. The press itself is what aims core at that zone.
   const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
   const strip =
-    strips.find((candidate) =>
-      stripTabIds(candidate).includes(`${TILE_PANE_PREFIX}${focused}`),
-    ) ?? strips[0];
+    strips.find((candidate) => stripTabIds(candidate).includes(`${TILE_PANE_PREFIX}${focused}`)) ??
+    strips[0];
   const button = stripAddButton(strip);
   if (!button) return false;
   // pointerdown FIRST: the wrapper's capture handler is what tells core which
@@ -898,9 +968,7 @@ function frontChatTab(sessionId) {
   const tab =
     typeof document === "undefined"
       ? null
-      : document.querySelector(
-          `[data-tree-tab="${TILE_PANE_PREFIX}${sessionId}"]`,
-        );
+      : document.querySelector(`[data-tree-tab="${TILE_PANE_PREFIX}${sessionId}"]`);
   if (tab) {
     try {
       const Press = globalThis.PointerEvent ?? globalThis.MouseEvent;
@@ -1100,6 +1168,28 @@ function watchNewThreads() {
     // A chat that already existed when the arm was set is the user visiting
     // another chat, not the new one: it must not consume the arm.
     if (pending.known?.has(sessionId)) return;
+    // Chats this plugin opens itself are never a draft's mint. The arm is
+    // id-less while the primary draft is fronted, and every unseen id looks like
+    // a mint to this door, so a thread clicked in this pane - a cron mirror, a
+    // thread another client made, an Apropos child - would otherwise be filed
+    // under the home topic.
+    if (ownChatIds.has(sessionId)) return;
+    // The listing already carries it, so it is filed and cannot be the mint
+    // either. Same cache read as the arming side: a scope-keyed lookup would go
+    // blind whenever the prefetch and the gateway disagree about `connectionId`.
+    const filed = cachedTopoi(["topoi", "threads"], scopeNow());
+    if (filedSessionIds(filed).has(sessionId)) return;
+    // The arm has no id yet, so it belongs to the primary draft, and this id is
+    // not necessarily a mint: the strip's "+" docks a chat with no turns, and
+    // filing that now would start fileThread's window with no row to bind, then
+    // let it expire before the first send. Convert the arm and let turns decide.
+    // A draft's send already has its row, so it binds at once; a fresh "+" tab
+    // waits for its first turn.
+    if (pending.home === true && !pending.sessionId) {
+      setPendingThread({ ...pending, awaitTurn: true, sessionId, seenId: sessionId });
+      void settleHomeArm();
+      return;
+    }
     // The chat the app just minted IS the new thread: adopt it, so the note
     // follows it into its new tab and its filing waits for the row write the
     // same way an adopted tab's does.
@@ -1108,18 +1198,361 @@ function watchNewThreads() {
   });
 }
 
+// ---- the home default --------------------------------------------------------
+
+// The home default. A tab the app mints on its own (the strip's "+", the
+// new-session shortcut) has no plugin door: core mints it, so focus is the only
+// signal this half can watch. A mint docks a tile and focuses it, and its id is
+// one this window has never held, which separates it from a switch to an empty
+// tab the user already had.
+//
+// The arm is the sidebar's, except that nothing binds until the draft's first
+// turn. fileThread's retry window starts when it is called, so a tab opened at
+// nine and sent at ten would spend that window on a row that cannot exist yet,
+// then drop the filing without a word.
+
+// The strip can still be mounting its tiles this early, so an id focused in the
+// first moments after load is the restore settling, not a mint.
+const HOME_STARTUP_MS = 2000;
+
+// The connection the query keys are scoped by, read without a hook: the value
+// useScope answers, so a read here hits the cache the panes filled. The two must
+// stay in lockstep, because a divergence reads a cold cache and pays a REST read
+// on every mint instead.
+const scopeNow = () => host.state?.connectionId?.get?.() ?? "local";
+
+// The registry and the thread listing as the panes last saw them, with one read
+// each through the same fetchers the panes use when nothing is cached. Either
+// may come back null, and every caller reads that as "arm nothing" rather than
+// guessing: filing under a topic the user never chose is worse than leaving a
+// draft unfiled.
+async function registrySnapshot() {
+  const scope = scopeNow();
+  const read = (fetcher) => (rest ? fetcher().catch(() => null) : null);
+  return {
+    threads: queryClient.getQueryData(THREADS_KEY(scope)) ?? (await read(fetchThreads)),
+    topics: queryClient.getQueryData(TOPICS_KEY(scope)) ?? (await read(fetchTopics)),
+  };
+}
+
+// The registry's home, and only a live one. An absent home_id, or one naming an
+// entry the registry dropped or archived, answers null: fallbackHome() repairs a
+// deletion write, and borrowing it here would file chats under a topic nobody
+// picked. An archived home arms nothing because its section leaves the tree, so
+// the thread would look lost rather than filed.
+const homeTopic = (topics) => {
+  const homeId = topics?.home_id;
+  if (typeof homeId !== "string" || !homeId) return null;
+  const entries = topics.entries ?? [];
+  return entries.find((entry) => entry.id === homeId && !entry.archived) ?? null;
+};
+
+// Both ids a listed row carries, because focus can report either: the live chain
+// tip and the lineage root a binding keys on.
+const filedSessionIds = (threads) => {
+  const ids = new Set();
+  for (const row of threads?.threads ?? []) {
+    if (row.session_id) ids.add(row.session_id);
+    if (row.lineage_root) ids.add(row.lineage_root);
+  }
+  return ids;
+};
+
+// Arms a chat the app minted itself (the strip's "+", the new-session shortcut).
+// Only a chat with no turns qualifies: anything else is a conversation the user
+// opened, and filing it under a topic nobody picked is worse than leaving it
+// alone. The primary pane's draft never reaches here, because it has no id until
+// its send (watchNewThreads handles that), so no turn-count guess is needed.
+async function armHomeDefault(sessionId) {
+  // A reload nulls `rest` between this call and its reads: arm nothing rather
+  // than throwing inside a promise nobody awaits.
+  if (rest == null) return;
+  const [snapshot, lookup] = await Promise.all([registrySnapshot(), loadTurnLookup()]);
+  const entry = homeTopic(snapshot.topics);
+  if (!entry) return;
+  // The listing already carries it, so it is filed: a branch, a cron thread, or
+  // a chat filed by hand. Never a fresh tab of ours.
+  if (filedSessionIds(snapshot.threads).has(sessionId)) return;
+  // An arm already exists, so a click in this pane is deliberate and owns it: a
+  // default must never replace one. This also covers the id-less draft arm,
+  // which is set before a mint exists and is what will file it.
+  if ($pendingThread.get()) return;
+  // An unanswered listing proves nothing at all, and isUnstarted answers false
+  // there, so a refused socket arms nothing rather than filing a live chat.
+  if (!isUnstarted(lookup, sessionId)) return;
+  // The user left the tab while these reads were in flight: the default no
+  // longer applies to it.
+  if ((host.state?.focusedStoredSessionId?.get?.() ?? null) !== sessionId) return;
+  setPendingThread({
+    at: Date.now(),
+    awaitTurn: true,
+    home: true,
+    known: null,
+    seenId: sessionId,
+    sessionId,
+    topicId: entry.id,
+    topicName: entry.name ?? entry.id,
+  });
+}
+
+// The newest cached value under a topoi key root, whichever connection scope wrote
+// it. register() can prefetch before the gateway publishes its connection id, and
+// on a scope mismatch a scope-keyed read would miss the registry for the rest of
+// the session: the feature would go inert with no error to chase.
+function cachedTopoi(root, scope) {
+  const direct = queryClient.getQueryData([...root, scope]);
+  if (direct) return direct;
+  let newest = null;
+  let at = -1;
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: root })) {
+    const data = query.state?.data;
+    if (!data) continue;
+    if ((query.state?.dataUpdatedAt ?? 0) > at) {
+      at = query.state?.dataUpdatedAt ?? 0;
+      newest = data;
+    }
+  }
+  return newest;
+}
+
+// The home topic as the Topics pane last saw it, read synchronously. The arm has
+// to exist before the send, so it cannot wait on a round trip: a paste and Enter
+// beats two RPCs, and an arm that lands after the mint files nothing. The pane is
+// uncloseable, so the registry is warm in practice; a cold cache arms nothing,
+// which is the same result as no home configured.
+const homeTopicFromCache = () => homeTopic(cachedTopoi(["topoi", "topics"], scopeNow()));
+
+// The ids a draft's mint must not be mistaken for, as far as the cache can tell:
+// the open chat tabs, the focused chat, and every thread the listing carries. The
+// live session listing can name more, so this is upgraded once the arm is set.
+function knownFromCache() {
+  const ids = new Set(openChatTabIds());
+  const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
+  if (focused) ids.add(focused);
+  for (const id of filedSessionIds(cachedTopoi(["topoi", "threads"], scopeNow()))) {
+    ids.add(id);
+  }
+  return ids;
+}
+
+// Arms the primary pane's draft: the surface the sidebar's New session row and
+// Alt+N both produce, and the only new-chat door with no id to key on. Its send
+// mints the chat, and watchNewThreads (which takes the first id an arm has never
+// seen) converts this arm and settles it. Hence no sessionId and no `awaitTurn`:
+// there is nothing to wait for until the mint exists.
+function armHomeDraft() {
+  if (rest == null) return;
+  const entry = homeTopicFromCache();
+  if (!entry) return;
+  // A send can beat even this call, in which case the focus is already the mint
+  // and armHomeDefault's eager path is the one that applies.
+  if ((host.state?.focusedStoredSessionId?.get?.() ?? null) !== null) return;
+  // A click in this pane still wins, and an arm of this same shape is already
+  // correct.
+  if ($pendingThread.get()) return;
+  const at = Date.now();
+  setPendingThread({
+    at,
+    awaitTurn: false,
+    home: true,
+    known: knownFromCache(),
+    seenId: null,
+    sessionId: null,
+    topicId: entry.id,
+    topicName: entry.name ?? entry.id,
+  });
+  // Upgrade the guard with the live listing, which knows chats the cache does not
+  // (a chat closed but never filed). The arm is already live, so a send landing
+  // inside this read is still filed correctly.
+  void knownSessionIds().then((known) => {
+    if (!(known instanceof Set)) return;
+    const pending = $pendingThread.get();
+    if (!pending || pending.at !== at || pending.sessionId) return;
+    setPendingThread({
+      ...pending,
+      known: new Set([...(pending.known ?? []), ...known]),
+    });
+  });
+}
+
+// Whether the armed home draft has produced its first turn. Two cheap signals
+// drive it, the gateway's sessions.changed (the row write that follows a send)
+// and a focus change, and neither is a timer, so a parked tab costs nothing and
+// files the moment it is used. The event can arrive before the message is
+// committed, and then this read sees an empty draft and no further signal comes;
+// that costs a late filing rather than a lost one, because the next focus change
+// settles it. A signal which arrives during a settle is replayed once, since the
+// listing read takes long enough for a send to land inside it.
+let settlingHome = false;
+let resettleHome = false;
+async function settleHomeArm(departed = false) {
+  // Same reload window as armHomeDefault: a nulled `rest` means the plugin is
+  // gone, and fileThread would call it on null.
+  if (rest == null) return;
+  const armed = $pendingThread.get();
+  if (!armed?.awaitTurn || !armed.sessionId) return;
+  if (settlingHome) {
+    resettleHome = true;
+    return;
+  }
+  settlingHome = true;
+  try {
+    const lookup = await loadTurnLookup();
+    const turns = lookup.turns(armed.sessionId);
+    if (turns === null || turns === 0) {
+      // Nothing sent. `departed` comes from the focus watcher, after the user has
+      // left the draft: a tab that is gone from the strip was closed unsent, and a
+      // dead arm would block every later mint. Two guards keep that from firing
+      // wrongly. The strips must be readable at all (`tabs.length`), because an
+      // empty read means this desktop's tab markup was not found, not that every
+      // tab closed. And the arm must be older than HOME_STARTUP_MS, because a
+      // restore docks its tiles one at a time and sees the others before this one
+      // mounts.
+      if (departed && Date.now() - armed.at > HOME_STARTUP_MS) {
+        const tabs = openChatTabIds();
+        if (tabs.length > 0 && !tabs.includes(armed.sessionId)) setPendingThread(null);
+      }
+      return;
+    }
+    // A newer arm (a sidebar click) may have landed while the listing was read.
+    // It does not cancel this filing: the arm describes this chat, whose first
+    // send did happen, so the topic it named is correct. Only the arm is handed
+    // over, which is why the bind goes through fileThread rather than
+    // fileAdoptedTab's stillWanted test.
+    void fileThread(armed.sessionId, armed.topicId, armed.topicName);
+    if ($pendingThread.get() === armed) setPendingThread(null);
+  } finally {
+    settlingHome = false;
+    if (resettleHome) {
+      resettleHome = false;
+      void settleHomeArm();
+    }
+  }
+}
+
+// Arms the draft when it is genuinely the fronted pane, retrying briefly instead
+// of trusting one read. Two things can lag: pane visibility can publish a tick
+// after the focus atom does (so the first look misses the draft it is staring at),
+// and the registry can be cold, in which case armHomeDraft finds no home. Both are
+// bounded re-checks, never a loop, and every attempt re-tests the live focus, so a
+// user who has already moved on is left alone.
+function armDraftIfFronted(attempt = 0) {
+  if (rest == null) return;
+  if ((host.state?.focusedStoredSessionId?.get?.() ?? null) !== null) return;
+  if (!primaryDraftOnScreen(null)) {
+    if (attempt < 2) globalThis.setTimeout(() => armDraftIfFronted(attempt + 1), 80);
+    return;
+  }
+  // A parked default from an earlier mint was a tab nobody typed into, and it would
+  // block this surface through armHomeDefault's "an arm already exists" test. One
+  // arm at a time, so the newest surface wins.
+  const parked = $pendingThread.get();
+  if (parked?.awaitTurn === true) setPendingThread(null);
+  if ($pendingThread.get()) return;
+  if (!homeTopicFromCache()) {
+    if (attempt < 2) globalThis.setTimeout(() => armDraftIfFronted(attempt + 1), 120);
+    return;
+  }
+  armHomeDraft();
+}
+
+// Watches focus for a chat id this window has never held. That set is the sole
+// test, and it grows only from ids focus has visited, never from a later listing,
+// which would make an old chat look like a mint. Seeded from the gateway listing
+// (empty on a refused socket), the open chat tabs and the focused chat, so a
+// restored window starts holding every id it can see. An id is recorded before it
+// is armed, so a declined candidate is never reconsidered and a re-focus cannot
+// loop.
+function watchHomeDefault() {
+  const focusedAtom = host.state?.focusedStoredSessionId;
+  if (!focusedAtom?.listen) return () => {};
+  // The focused chat's turn flag: a send flips it, which is when the draft stops
+  // being a draft. A second signal beside sessions.changed, because that broadcast
+  // is a state.db signature with a floor, and the common path (press +, type, send,
+  // never switch tabs) has no focus change to settle it. Both edges fire, since the
+  // rising one can land before the message commit. A stray edge costs one call:
+  // settleHomeArm returns early with no live arm.
+  const stopBusy = host.state?.busy?.listen?.(() => {
+    void settleHomeArm();
+  });
+  const old = new Set(openChatTabIds());
+  const start = focusedAtom.get?.() ?? null;
+  if (start) old.add(start);
+  void knownSessionIds().then((ids) => {
+    for (const id of ids ?? []) old.add(id);
+  });
+  const settledAfter = Date.now() + HOME_STARTUP_MS;
+  // The focus watcher only sees changes, so a reload that lands while the draft is
+  // already on screen (the normal state after a plugin reload) would never arm it.
+  // One check after the restore settles covers that case.
+  const primeDraft = globalThis.setTimeout(() => {
+    if ((focusedAtom.get?.() ?? null) !== null) return;
+    if ($pendingThread.get() || !primaryDraftOnScreen(null)) return;
+    void armHomeDraft();
+  }, HOME_STARTUP_MS + 100);
+  let last = start;
+  const stopFocused = focusedAtom.listen((next) => {
+    if (next === last) return;
+    last = next;
+    // Settled here, where a tile minted earlier has long been docked, rather
+    // than on an event which can arrive while one is still mounting. This call
+    // suspends on its listing read, so nothing below may clear the arm it is
+    // holding: a send-then-switch would lose the filing. Only its own departed
+    // rule (the tab is gone from the strip) ends a parked arm.
+    void settleHomeArm(true);
+    // Nothing focused means the primary pane's draft, the surface the sidebar's
+    // New session row and Alt+N both produce. It has no id to key an arm on, so the
+    // arm is id-less; watchNewThreads runs first (registered before this watcher),
+    // converts it and settles it, which is the step that actually files the thread.
+    // Only when the draft is the fronted pane: a focus-clear behind a page or a
+    // tool panel is not a new chat.
+    if (!next) {
+      if (Date.now() >= settledAfter) armDraftIfFronted();
+      return;
+    }
+    // Visited ids are never reconsidered, so a declined candidate cannot come
+    // back as a mint and a re-focus cannot loop.
+    const seen = old.has(next);
+    old.add(next);
+    if (Date.now() < settledAfter) return;
+    if (seen || ownChatIds.has(next)) {
+      // An id-less arm is only honest while the draft is fronted. Left alive
+      // through a move to a chat this window already knew, it would sit waiting
+      // for the next unseen id and file that one under the home topic.
+      const stale = $pendingThread.get();
+      if (stale && stale.home === true && !stale.sessionId) setPendingThread(null);
+      return;
+    }
+    // A parked default never outlives a newer mint. This mint's own arm is the
+    // exception: watchNewThreads runs first and may have just converted the id-less
+    // draft arm into a parked one naming `next`, so clearing that here would drop
+    // the filing it exists for. Only a different id is superseded.
+    const parked = $pendingThread.get();
+    if (parked?.awaitTurn === true && parked.sessionId !== next) setPendingThread(null);
+    // A click in this pane always wins over a default. An id-less draft arm sitting
+    // here is expected: it is what files this mint, through watchNewThreads.
+    if ($pendingThread.get()) return;
+    void armHomeDefault(next);
+  });
+  // Both listeners plus the primer come back through ctx.onDispose: a reload that
+  // left them live would keep calling into a dead module instance.
+  return () => {
+    globalThis.clearTimeout(primeDraft);
+    stopFocused();
+    stopBusy?.();
+  };
+}
+
 // ---- the pane ----------------------------------------------------------------
 
-// While a New thread click is armed, the composer's top strip names the topic
-// the chat will be filed under: the chat itself carries no such mark. An adopted
-// draft tab shows it while IT is the focused chat; the main-pane draft shows it
-// while nothing is focused, so it never follows the user into another chat.
+// The composer's top strip, naming the topic the focused chat will be filed
+// under: the chat itself carries no such mark. An arm that names a chat shows
+// while that chat is focused; the id-less draft arm shows while nothing is
+// focused, so neither follows the user into another chat.
 function ArmBanner() {
   const pending = useValue($pendingThread);
   const focused = useValue(host.state.focusedStoredSessionId);
-  const onTarget = pending?.sessionId
-    ? focused === pending.sessionId
-    : focused == null;
+  const onTarget = pending?.sessionId ? focused === pending.sessionId : focused == null;
   if (!pending || !onTarget) {
     return null;
   }
@@ -1136,27 +1569,6 @@ function ArmBanner() {
     ],
   });
 }
-
-// The statuses the app's own session surfaces paint, from the one map the
-// builtin sidebar's status dot reads (feature-detected: an older host has no
-// such atom and the rows simply show no dot).
-const EMPTY_STATUSES = atom({});
-
-const DOT_CLASS = {
-  background: "topoi-dot topoi-dot-background",
-  "needs-input": "topoi-dot topoi-dot-attention",
-  stalled: "topoi-dot topoi-dot-stalled",
-  unread: "topoi-dot topoi-dot-unread",
-  working: "topoi-dot topoi-dot-working",
-};
-
-const DOT_LABEL = {
-  background: "Running in the background",
-  "needs-input": "Waiting for an answer",
-  stalled: "Session running",
-  unread: "Finished, unread",
-  working: "Session running",
-};
 
 // The row age, the builtin session row's compact spelling: under a minute
 // reads "now", then 5m / 2h / 3d. coarseElapsed owns the buckets (the SDK's
@@ -1209,10 +1621,7 @@ function CronReader({ thread }) {
                 className: "topoi-reader-reply",
                 onClick: reply,
                 size: "sm",
-                children: [
-                  jsx(Codicon, { name: "comment-discussion", size: "0.875rem" }),
-                  "Reply",
-                ],
+                children: [jsx(Codicon, { name: "comment-discussion", size: "0.875rem" }), "Reply"],
               })
             : null,
           when
@@ -1230,8 +1639,7 @@ function CronReader({ thread }) {
           : query.error || !doc
             ? jsx("div", {
                 className: "topoi-reader-note",
-                children:
-                  "This result could not be read. It may have been deleted.",
+                children: "This result could not be read. It may have been deleted.",
               })
             : doc.markdown
               ? jsx("div", {
@@ -1247,14 +1655,23 @@ function CronReader({ thread }) {
   });
 }
 
-// One thread row, shaped like the builtin sidebar's session row: the date
-// sits in a column that never shrinks while the title truncates against it.
-// The sidebar copy carries the app's session statuses (the open band and the
-// status dot); the topic tab keeps the delete action and nothing else.
-function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showStatus = false, thread }) {
+// One thread row, shaped like the builtin sidebar's session row: the date sits
+// in a column that never shrinks while the title truncates against it, and a
+// status row reserves the dot's cell ahead of the title, so a thread going
+// quiet keeps its text still. The dot is core's SessionStatusDot, keyed by the
+// thread's stored session id. The sidebar copy carries the app's session
+// statuses (the open band and the dot); the topic tab keeps the delete action
+// and nothing else.
+function ThreadRow({
+  deletable = false,
+  entries = [],
+  hint = null,
+  onOpen,
+  showStatus = false,
+  thread,
+}) {
   const [pendingDelete, setPendingDelete] = useState(false);
   const focused = useValue(host.state.focusedStoredSessionId);
-  const statuses = useValue(host.state.sessionStatuses ?? EMPTY_STATUSES);
   const title = thread.title || thread.session_id;
   // The REST surface ships epoch SECONDS; the age label buckets them app-side.
   const seconds = thread.last_active || thread.started_at;
@@ -1268,8 +1685,7 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
   const readerIds = useValue($cronReaderIds);
   const isReader = readerIds.has(thread.session_id);
   const focusHit =
-    focused != null &&
-    (thread.session_id === focused || thread.lineage_root === focused);
+    focused != null && (thread.session_id === focused || thread.lineage_root === focused);
   // Only rows that CAN be lit subscribe to the layout: the reader's own tab
   // while it is the result being read, and the focused chat's panes (the
   // primary `workspace` chat or its `session-tile:<id>` stack entry).
@@ -1277,13 +1693,9 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
     isReader ? paneTab(`plugin-workspace:cron-${thread.session_id}`) : NO_TAB,
   );
   const primaryTab = useValue(focusHit ? paneTab("workspace") : NO_TAB);
-  const tileTab = useValue(
-    focusHit ? paneTab(`session-tile:${thread.session_id}`) : NO_TAB,
-  );
+  const tileTab = useValue(focusHit ? paneTab(`session-tile:${thread.session_id}`) : NO_TAB);
   const rootTab = useValue(
-    focusHit && thread.lineage_root
-      ? paneTab(`session-tile:${thread.lineage_root}`)
-      : NO_TAB,
+    focusHit && thread.lineage_root ? paneTab(`session-tile:${thread.lineage_root}`) : NO_TAB,
   );
   const readable = paneTabsReadable();
   // Several readers can be open at once, so every row asks about its OWN tab.
@@ -1294,23 +1706,22 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
     : isReader && [...readerIds].at(-1) === thread.session_id;
   const fronted = !readable || primaryTab || tileTab || rootTab;
   const opened = showStatus && (reading || (focusHit && fronted));
-  const status = showStatus
-    ? (statuses[thread.session_id] ?? statuses[thread.lineage_root] ?? "idle")
-    : "idle";
   // The move sub's targets: every registry entry but the thread's own topic
   // (moving to the same one is a no-op, so it is not offered). A cron result has
   // no move to offer: its topic is the adapter-minted chat_id, and resolution
   // returns that before any binding, so a re-file could never take effect.
-  const others = thread.cron_result
-    ? []
-    : entries.filter((item) => item.id !== thread.topic_id);
-  const dot = DOT_CLASS[status]
-    ? jsx("span", {
-        "aria-label": DOT_LABEL[status],
-        className: DOT_CLASS[status],
-        role: "status",
-        title: DOT_LABEL[status],
-      })
+  const others = thread.cron_result ? [] : entries.filter((item) => item.id !== thread.topic_id);
+  // Core's own dot, keyed by the thread's stored session id: the same primitive
+  // the builtin sidebar and the pane tabs render, so a thread can never disagree
+  // with them about what it is doing. It resolves idle, draft and every live
+  // state itself, and paints an idle mark rather than leaving the cell empty.
+  // Deliberately no lineage_root fallback: the store is keyed by the stored id,
+  // and the root is the binding key, so a branch row would inherit its parent's
+  // status. The import is a hard requirement rather than a feature test: the
+  // runtime shim re-exports the SDK by name, so a build without this primitive
+  // cannot satisfy it.
+  const dot = showStatus
+    ? jsx(SessionStatusDot, { storedSessionId: thread.session_id ?? null })
     : null;
   return jsxs("div", {
     className: "topoi-row",
@@ -1328,7 +1739,7 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
               title: hint || undefined,
               type: "button",
               children: [
-                dot,
+                showStatus && jsx("span", { className: "topoi-lead", children: dot }),
                 jsx("span", { className: "topoi-row-title", children: title }),
                 when && jsx("span", { className: "topoi-row-time", children: when }),
               ],
@@ -1363,10 +1774,7 @@ function ThreadRow({ deletable = false, entries = [], hint = null, onOpen, showS
                 jsxs(ContextMenuSub, {
                   children: [
                     jsxs(ContextMenuSubTrigger, {
-                      children: [
-                        jsx(Codicon, { name: "move", size: "0.875rem" }),
-                        "Move to topic",
-                      ],
+                      children: [jsx(Codicon, { name: "move", size: "0.875rem" }), "Move to topic"],
                     }),
                     jsxs(ContextMenuSubContent, {
                       children: others.map((entry) =>
@@ -1441,7 +1849,13 @@ function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
         title: "Open topic",
         type: "button",
         children: [
-          entry?.id === homeId && jsx("span", { className: "topoi-home-dot" }),
+          // The head reserves the rows' own lead cell, so a topic's name and the
+          // titles under it share one left edge instead of the rows starting
+          // 20px in from their own header.
+          jsx("span", {
+            className: "topoi-lead",
+            children: entry?.id === homeId && jsx("span", { className: "topoi-home-dot" }),
+          }),
           jsx("span", { className: "topoi-topic-label", children: entry?.name ?? entry?.id }),
         ],
       }),
@@ -1479,10 +1893,9 @@ const isRecentThread = (thread, now) => {
 
 function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle, threads }) {
   const now = Date.now();
-  const shown = threads.filter((thread) => isRecentThread(thread, now)).slice(0, PANE_THREADS);
-  // Threads past the window are hidden rows but still counted: "N more" is how
-  // many the section is holding back, and its button opens the full list.
-  const hidden = threads.length - shown.length;
+  // Recent threads only, and never more than SECTION_THREADS of them: older
+  // rows and the overflow live in the topic tab, which the head opens.
+  const shown = threads.filter((thread) => isRecentThread(thread, now)).slice(0, SECTION_THREADS);
   return jsxs("div", {
     className: "topoi-section",
     children: [
@@ -1503,15 +1916,6 @@ function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle,
             thread,
           }),
         ),
-      expanded &&
-        onOpenTopic &&
-        hidden > 0 &&
-        jsx("button", {
-          className: "topoi-more",
-          onClick: () => onOpenTopic(entry),
-          type: "button",
-          children: `${hidden} more`,
-        }),
     ],
   });
 }
@@ -1528,7 +1932,10 @@ function TopicTree() {
     queryKey: THREADS_KEY(scope),
     staleTime: 30_000,
   });
-  // Fold state is a per-machine preference and survives a reload.
+  // Fold state is a per-machine preference and survives a reload. The map holds
+  // folded ids only: absence means open, so a fresh install starts with every topic
+  // expanded and the map stays small. An older map still reads correctly (a stored
+  // `false` is folded, a stored `true` is open under `!== false`), so no migration.
   const [expanded, setExpanded] = useState(() => storage?.get("expanded", {}) ?? {});
 
   if (topicsQuery.error || threadsQuery.error) {
@@ -1546,9 +1953,16 @@ function TopicTree() {
   const homeId = topicsQuery.data?.home_id;
   const threads = threadsQuery.data?.threads ?? [];
   const groups = groupThreads(entries, threads);
+  // Absence means open, so the map is the exception list rather than a state for
+  // every topic. `current` is the value inside the updater, never the render's
+  // `expanded`, or a burst of clicks would fold from a stale read. Opening deletes
+  // the key, which keeps the map one-way and small.
+  const isOpen = (id) => expanded[id] !== false;
   const toggle = (id) =>
     setExpanded((current) => {
-      const next = { ...current, [id]: !current[id] };
+      const next = { ...current };
+      if (current[id] !== false) next[id] = false;
+      else delete next[id];
       storage?.set("expanded", next);
       return next;
     });
@@ -1565,7 +1979,7 @@ function TopicTree() {
               {
                 entries,
                 entry: group.entry,
-                expanded: Boolean(expanded[group.entry.id]),
+                expanded: isOpen(group.entry.id),
                 homeId,
                 onOpenTopic: openTopicTab,
                 onToggle: () => toggle(group.entry.id),
@@ -1894,9 +2308,12 @@ export default {
     rest = ctx.rest;
     storage = ctx.storage;
     ctx.onDispose(() => {
+      // The atom only, so PENDING_THREAD_KEY survives: the durable mirror is what
+      // lets a reload or a plugin swap restore an in-flight arm, which
+      // restorePendingThread reads. setPendingThread would clear the key too.
+      $pendingThread.set(null);
       rest = null;
       storage = null;
-      $pendingThread.set(null);
     });
     const style = document.createElement("style");
     style.textContent = CSS;
@@ -1906,6 +2323,19 @@ export default {
     // An arm a previous session persisted survives the restart or reload
     // that brought this register() back.
     restorePendingThread();
+
+    // The home default arms the primary draft from the cache, because the arm has
+    // to exist before a send can beat it. Warm both keys here so a collapsed
+    // Topics column - which never mounts the pane's queries - can still default a
+    // chat, and so watchNewThreads' "already filed" guard has a listing to read.
+    if (rest) {
+      for (const [queryKey, queryFn] of [
+        [TOPICS_KEY(scopeNow()), fetchTopics],
+        [THREADS_KEY(scopeNow()), fetchThreads],
+      ]) {
+        void queryClient.prefetchQuery({ queryKey, queryFn, staleTime: 30_000 }).catch(() => {});
+      }
+    }
 
     // Registry changes arrive over the gateway event stream; thread lists and
     // open topic tabs refresh on the gateway's own sessions.changed. Bindings
@@ -1917,9 +2347,17 @@ export default {
       queryClient.invalidateQueries({ queryKey: ["topoi", "threads"] });
       queryClient.invalidateQueries({ queryKey: ["topoi", "topic"] });
       queryClient.invalidateQueries({ queryKey: ["topoi", "cron"] });
+      // Only the armed chat's own movement settles it: this event fires for every
+      // session in the house, cron traffic included, and each stray call would be
+      // two reads for nothing. A send-then-switch is covered by the focus
+      // listener's own departed settle.
+      const armed = $pendingThread.get();
+      const focusedNow = host.state?.focusedStoredSessionId?.get?.() ?? null;
+      if (armed?.awaitTurn && armed.sessionId === focusedNow) void settleHomeArm();
     });
 
     ctx.onDispose(watchNewThreads());
+    ctx.onDispose(watchHomeDefault());
     ctx.onDispose(() => {
       const closes = [...topicTabs.values()];
       topicTabs.clear();

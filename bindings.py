@@ -13,10 +13,9 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -159,35 +158,3 @@ def sweep_dead_roots(exists) -> int:
             "[topoi] swept %d binding(s) to sessions no longer in the store", dropped
         )
     return dropped
-
-
-def adopt_config_block(block: Any) -> int:
-    """One-time migration: import a legacy config-level bindings block into the store.
-
-    INSERT OR IGNORE, so whatever the store already holds wins; a config block can only be older. Returns the adopted count.
-    """
-    if not isinstance(block, Mapping):
-        return 0
-    statements: list[tuple[str, tuple]] = []
-    now = int(time.time() * 1000)
-    for root, topic in block.items():
-        key = str(root or "").strip()
-        value = str(topic or "").strip()
-        if _ROOT_RE.match(key) and value:
-            statements.append(
-                (
-                    (
-                        "INSERT OR IGNORE INTO bindings (lineage_root, topic_id, updated_at)"
-                        " VALUES (?, ?, ?)"
-                    ),
-                    (key, value, now),
-                )
-            )
-    if not statements:
-        return 0
-    adopted = _apply(statements)
-    if adopted:
-        logger.info(
-            "[topoi] adopted %d binding(s) from the legacy config block", adopted
-        )
-    return adopted

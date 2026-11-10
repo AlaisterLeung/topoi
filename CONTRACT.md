@@ -32,14 +32,14 @@ platforms:
     enabled: true
     topics:                       # the registry, gateway-owned, see topic_store.py
       updated_at: 1791372109923   # epoch ms of the last stored write
-      home_id: t_system
+      home_id: t_general
       entries:
         - {id: t_general, name: General}
         - {id: t_work, name: Work, archived: true}
     home_channel:                 # framework projection of home_id, written with it
       platform: topoi
-      chat_id: t_system
-      name: System
+      chat_id: t_general
+      name: General
 ```
 
 `home_channel` is the only configured-home key. It seeds the home when no registry is stored yet, and the registry rewrites it whenever `home_id` moves, so the delivery home a bare `deliver=topoi` targets never drifts from the home the app shows.
@@ -61,9 +61,7 @@ A session's topic is resolved as follows:
 - A scheduled run (`source: cron`) resolves from its job's delivery lane, a read of the job store rather than a binding.
 - Every other session resolves through the store, keyed by lineage root.
 
-The only write path is `POST /threads/bind`: a client files a freshly created chat under a topic, or moves a listed thread (a scheduled run included) to another one with `move: true`. Without that flag a bind only ever creates a filing: if the thread already sits under a different topic the route answers 409, so a client that fires on the wrong chat cannot relocate it. There is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path. A legacy config-level `bindings` block (left by an earlier build) is ignored on read, adopted into the store once on the first `GET /topics`, and dropped by the next registry write.
-
-An older block may still use the retired `items` / `revision` spellings; they are ignored, never half-read.
+The only write path is `POST /threads/bind`: a client files a freshly created chat under a topic, or moves a listed thread (a scheduled run included) to another one with `move: true`. Without that flag a bind only ever creates a filing: if the thread already sits under a different topic the route answers 409, so a client that fires on the wrong chat cannot relocate it. There is no unfile operation, so a thread's topic is fixed once it is filed. Deleting a topic prunes its bindings in the same registry write, and bindings to sessions that no longer exist are swept opportunistically on the bind path.
 
 ### 2.3 Cron thread pairings
 
@@ -79,11 +77,11 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 
 ### 3.1 `GET /topics`
 
-`GET /topics` returns the registry: `updated_at`, `home_id`, and `entries` in order. Bindings are server-side only and are never shipped as a map. Deleted topics are not tracked anywhere. Only a topic with no threads can be deleted (both clients offer delete only for a 0-thread topic), so there is no tombstone list. A leftover `deleted` key in the block is ignored on read, and the next registry write drops it from the file.
+`GET /topics` returns the registry: `updated_at`, `home_id`, and `entries` in order. Bindings are server-side only and are never shipped as a map. Deleted topics are not tracked anywhere. Only a topic with no threads can be deleted (both clients offer delete only for a 0-thread topic), so there is no tombstone list. Unknown keys in the block are ignored on read, and the next registry write drops them from the file. An unreadable config answers 503, never a seed: this route is whole-state last-writer-wins, so a plausible default served here could be written back over the real registry.
 
 ### 3.2 `PUT /topics`
 
-`PUT /topics` stores a client-sent registry whole, last writer wins, and returns what was stored, stamped. A structural refusal (a bad id shape, a repeated id, a non-object state, an over-cap list) is a 422 carrying the reason, and the stored block is left untouched. A blank or over-long name is cleaned rather than refused.
+`PUT /topics` stores a client-sent registry whole, last writer wins, and returns what was stored, stamped. A structural refusal (a bad id shape, a repeated id, a non-object state, an over-cap list) is a 422 carrying the reason, and the stored block is left untouched. A blank or over-long name is cleaned rather than refused. An unreadable config is a 503 with nothing written, the same contract as the read.
 
 ### 3.3 `GET /threads`
 
@@ -122,7 +120,7 @@ Every registry write broadcasts `plugin.topoi.topics.changed`. Bindings need no 
 
 ### 3.7 The dashboard client
 
-The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (4), and its heading total counts exactly those threads. A thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
+The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (3, matching the desktop sidebar's `SECTION_THREADS`; the sidebar additionally drops threads older than 7 days, the card does not), and its heading total counts exactly those threads. A thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
 
 ### 3.8 `GET /threads/{session_id}/cron`
 

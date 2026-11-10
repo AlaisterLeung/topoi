@@ -1,6 +1,6 @@
 """Binding store check (zero-dep, throwaway HERMES_HOME).
 
-The session-to-topic index lives in a plugin-private SQLite store, not config.yaml: bindings are high-churn and unbounded, the registry is not, and the REST surface resolves a thread's topic server-side so clients never see the map. Covers the store lifecycle (set, overwrite, clear, mapping, persistence across fresh connections), pruning against the live topic set, the dead-root sweep with its threshold, root-shape refusal, the one-time adoption of a legacy config block, the cross-module seams the REST write path composes (a registry write pruning the store; the live-topic check gating a bind), and the sync bind core the async handler wraps (validation order, response shape, store effect). Run:
+The session-to-topic index lives in a plugin-private SQLite store, not config.yaml: bindings are high-churn and unbounded, the registry is not, and the REST surface resolves a thread's topic server-side so clients never see the map. Covers the store lifecycle (set, overwrite, clear, mapping, persistence across fresh connections), pruning against the live topic set, the dead-root sweep with its threshold, root-shape refusal, the cross-module seams the REST write path composes (a registry write pruning the store; the live-topic check gating a bind), and the sync bind core the async handler wraps (validation order, response shape, store effect). Run:
 
     ~/.hermes/hermes-agent/venv/bin/python tests/check_bindings.py
 
@@ -175,28 +175,14 @@ def main() -> int:
     store.drop_roots(list(store.mapping()))
     check("drop_roots empties the store", store.mapping() == {})
 
-    # One-time adoption of a legacy config block: valid rows import, junk is skipped,
-    # and what the store already holds is never overwritten.
-    adopted = store.adopt_config_block(
-        {"sess_x": "t_general", "bad id": "t_general", "sess_y": ""}
-    )
-    check(
-        "adoption imports valid rows and skips junk",
-        adopted == 1 and store.mapping() == {"sess_x": "t_general"},
-        (adopted, store.mapping()),
-    )
-    store.set_binding("sess_x", "t_work")
-    readopted = store.adopt_config_block({"sess_x": "t_general"})
-    check(
-        "adoption never overwrites what the store holds",
-        readopted == 0 and store.mapping()["sess_x"] == "t_work",
-        (readopted, store.mapping()),
-    )
-    check("a non-mapping block adopts nothing", store.adopt_config_block("nope") == 0)
-
     # The two seams the REST write path composes: a registry write prunes the store
     # (a deleted topic takes its bindings), and the live-topic check gates a bind.
+    # Two rows under the topic about to be deleted, set up HERE: do not lean on a row
+    # another section happened to leave behind. This assertion used to reach two only
+    # because the removed pre-store adoption section left `sess_x -> t_work` in the
+    # store, so deleting that section silently turned it into a one-row test.
     store.set_binding("sess_news", "t_news")
+    store.set_binding("sess_old", "t_news")
     store.set_binding("sess_test", "t_test")
     check(
         "the live-topic check sees the registry's entries",

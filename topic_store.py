@@ -10,16 +10,14 @@ Shape (CONTRACT.md section 2)::
       topoi:
         topics:
           updated_at: 1791372109923
-          home_id: t_system
+          home_id: t_general
           entries:
             - {id: t_general, name: General}
             - {id: t_work, name: Work, archived: true}
 
 ``updated_at`` is epoch milliseconds of the last stored write, nudged to stay strictly increasing if the clock stalls or steps back; ``home_id`` is the home topic the app highlights, and moving it also rewrites the framework's ``home_channel`` so the delivery home a cron job targets never drifts from the home the app shows.
 
-The pre-rename spellings (``items`` / ``revision``) are retired: only ``entries`` / ``updated_at`` are read. A state still carrying the old names is ignored (and logged once), never half-read.
-
-Deleted topics are NOT tracked: only an empty topic can be deleted, so a tombstone list would only guard an id reuse that cannot resurrect anything, and the next registry write drops any leftover ``deleted`` key from the block on its own.
+Deleted topics are NOT tracked. Only an empty topic can be deleted, so a tombstone list would only guard an id reuse that cannot resurrect anything, and a whole-block rewrite drops any unknown key on its own.
 
 """
 
@@ -34,8 +32,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "topoi"
-DEFAULT_HOME_ID = "t_system"
-DEFAULT_HOME_NAME = "System"
+DEFAULT_HOME_ID = "t_general"
+DEFAULT_HOME_NAME = "General"
 
 # CONTRACT.md section 2: an id outside this shape never becomes a topic, whatever wrote it.
 _TOPIC_RE = re.compile(r"^t_[a-z0-9_]+$")
@@ -43,22 +41,17 @@ _TOPIC_RE = re.compile(r"^t_[a-z0-9_]+$")
 MAX_ENTRIES = 500
 MAX_NAME_CHARS = 120
 
-# The retired pre-rename spellings; seeing them means an un-migrated block or a stale client, which is worth one log line rather than a silent empty registry.
-_RETIRED_KEYS = ("items", "revision")
-_warned_retired_keys = False
-
 
 class TopicError(ValueError):
     """A client-sent registry that cannot be stored, carrying the reason to send back."""
 
 
-def default_state() -> dict[str, Any]:
-    """The registry of a gateway that has never stored one: just the home topic."""
-    return {
-        "updated_at": 0,
-        "home_id": DEFAULT_HOME_ID,
-        "entries": [{"id": DEFAULT_HOME_ID, "name": DEFAULT_HOME_NAME}],
-    }
+class TopicStoreUnavailable(RuntimeError):
+    """The stored registry could not be read at all.
+
+    Deliberately not a ``TopicError``: the REST layer maps that to 422, and an
+    unreadable config is a retryable 503, not a bad request.
+    """
 
 
 def is_topic_id(raw: Any) -> bool:
@@ -86,23 +79,6 @@ def _stamp(raw: Any) -> int:
     return max(int(time.time() * 1000), previous + 1)
 
 
-def _warn_retired_keys(block: Mapping[str, Any]) -> None:
-    """Say once that a state still uses the retired names, so an un-migrated block never reads as an empty registry without a reason in the log."""
-    global _warned_retired_keys
-    if (
-        _warned_retired_keys
-        or "entries" in block
-        or not any(k in block for k in _RETIRED_KEYS)
-    ):
-        return
-    _warned_retired_keys = True
-    logger.warning(
-        "[topoi] topic registry uses the retired %s keys; only %s are read now, so this state is ignored",
-        " / ".join(_RETIRED_KEYS),
-        "entries / updated_at",
-    )
-
-
 def _section(config: Any) -> Mapping[str, Any]:
     """The ``platforms.topoi`` mapping of a loaded config; empty when it is missing or malformed."""
     platforms = config.get("platforms") if isinstance(config, Mapping) else None
@@ -113,7 +89,6 @@ def _section(config: Any) -> Mapping[str, Any]:
 def normalize_state(raw: Any) -> dict[str, Any]:
     """Coerce a stored or client-sent registry into the stored shape: invalid members are dropped, not trusted."""
     block = raw if isinstance(raw, Mapping) else {}
-    _warn_retired_keys(block)
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in block.get("entries") or []:
@@ -145,7 +120,7 @@ def normalize_state(raw: Any) -> dict[str, Any]:
 def validate_state(raw: Any) -> dict[str, Any]:
     """The registry a client asked to store, or a ``TopicError`` saying what is wrong with it.
 
-    Structural problems are refused loudly: a client that sends a bad id or repeats one has a bug worth seeing. A blank or over-long name is cleaned instead (the name is display text, not a key). A ``deleted`` list is ignored rather than refused, so a client still carrying the retired tombstone tracking keeps working; the next stored write drops the key either way.
+    Structural problems are refused loudly: a client that sends a bad id or repeats one has a bug worth seeing. A blank or over-long name is cleaned instead (the name is display text, not a key). Unknown keys are ignored, and the stored block is rebuilt from ``entries`` / ``home_id`` / ``updated_at`` alone.
     """
     if not isinstance(raw, Mapping):
         raise TopicError("topics.set requires a state object")
@@ -175,19 +150,25 @@ def validate_state(raw: Any) -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
-    """The stored registry, or the default one when nothing is stored yet.
+    """The stored registry, seeded from the configured home when nothing is stored yet.
 
     Reads through the core's config cache, so an operator edit to the block is picked up without a restart. With no block stored, the home topic is the gateway's configured one, which keeps the app's home and the delivery home on the same value from the first connect.
+
+    Raises ``TopicStoreUnavailable`` when the config cannot be read at all. Never a seed: this is the whole-state last-writer-wins route's read, so a plausible default served here can be PUT straight back over the real registry.
     """
     try:
         from hermes_cli.config import load_config_readonly
 
         section = _section(load_config_readonly())
-    except (
-        Exception
-    ):  # a config read failure must not take the REST surface down with it
-        logger.debug("[topoi] topic store read failed", exc_info=True)
-        return default_state()
+    except Exception as error:
+        # Not a seed: it would look real (one entry, the default home, updated_at 0) and this route is whole-state last-writer-wins, so a client that GETs the seed and PUTs it back wipes every stored topic.
+        # A 503 is retryable; a plausible wrong answer is not recoverable.
+        logger.warning(
+            "[topoi] topic store read failed; refusing to serve a seed", exc_info=True
+        )
+        raise TopicStoreUnavailable(
+            "the topic registry could not be read; refusing to serve a default a client could overwrite"
+        ) from error
     block = section.get("topics")
     home, name = _configured_home(section)
     if not isinstance(block, Mapping):
@@ -204,30 +185,10 @@ def load_state() -> dict[str, Any]:
     return state
 
 
-def legacy_bindings() -> Mapping[str, Any]:
-    """A pre-store ``bindings`` block still sitting in the config, for one-time adoption into the plugin store; empty when there is none.
-
-    The key is never read as registry state, and any registry write replaces the whole block, so the key disappears on the next write whether or not anyone adopts it.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        block = _section(load_config_readonly()).get("topics")
-    except Exception:  # an unreadable config must not fail the adoption attempt
-        logger.debug("[topoi] topic store read failed", exc_info=True)
-        return {}
-    if not isinstance(block, Mapping):
-        return {}
-    raw = block.get("bindings")
-    return raw if isinstance(raw, Mapping) else {}
-
-
 def _configured_home(section: Mapping[str, Any]) -> tuple[str, str]:
     """The gateway's own home topic and its label: the framework's ``home_channel`` projection.
 
-    The projection is the only configured-home key now (the retired ``home_topic`` / env pair
-    is gone), so an unset registry seeds from it and the app's home and the delivery home
-    agree from the first read.
+    It is the only configured-home key, so an unset registry seeds from it and the app's home and the delivery home agree from the first read.
     """
     channel = _home_channel(section)
     home = _valid_id(channel.get("chat_id")) or DEFAULT_HOME_ID
@@ -239,7 +200,11 @@ def _configured_home(section: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def home_id() -> str:
-    """The stored home topic id, or "" while no registry is stored (the caller keeps its own config/env home)."""
+    """The stored home topic id, or "" while no registry is stored (the caller keeps its own config/env home).
+
+    Unlike ``load_state``, this answers "" rather than raising: the adapter falls back to its startup ``home_channel`` snapshot, and a transient read failure should not abort every delivery.
+    Raising belongs on the REST read, where a wrong answer becomes a whole-state write.
+    """
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -351,7 +316,16 @@ def write_state(raw: Any) -> dict[str, Any]:
     from hermes_cli.config import _CONFIG_LOCK, load_config, save_config
 
     with _CONFIG_LOCK:
-        config = load_config()
+        try:
+            config = load_config()
+        except Exception as error:
+            # Same rule as the read, and nothing has been saved yet.
+            logger.warning(
+                "[topoi] topic store write could not read the config", exc_info=True
+            )
+            raise TopicStoreUnavailable(
+                "the config could not be read; nothing was written"
+            ) from error
         platforms = config.get("platforms")
         if not isinstance(platforms, dict):
             platforms = {}

@@ -1,6 +1,6 @@
 """Backend route check for the topoi REST surface (real router handlers, real store, throwaway HERMES_HOME).
 
-Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, and the delete route (row gone, binding dropped). The store logic (set / clear / prune / sweep / adopt) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
+Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, and the delete route (row gone, binding dropped). The store logic (set / clear / prune / sweep) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
 
     ~/.hermes/hermes-agent/venv/bin/python tests/check_backend.py
 

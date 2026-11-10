@@ -19,8 +19,8 @@
   const { timeAgo } = SDK.utils;
 
   const API = "/api/plugins/topoi";
-  const FALLBACK_HOME = "t_system";
-  const RECENT_PER_TOPIC = 4;
+  const FALLBACK_HOME = "t_general";
+  const RECENT_PER_TOPIC = 3;
   const THREAD_PAGE = 500;
 
   // Extract human-readable error messages:

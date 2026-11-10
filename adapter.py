@@ -30,7 +30,7 @@ from .topic_store import repair_home_projection as _repair_home_projection
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "topoi"
-DEFAULT_HOME_TOPIC = "t_system"
+DEFAULT_HOME_TOPIC = "t_general"
 
 # Bundled skills, registered read-only as ``topoi:<name>``. They load only when relevant, so an
 # agent scheduling a delivery reads the rule before picking a target, not after the topic stays empty.
@@ -234,7 +234,7 @@ def register(ctx) -> None:
         is_connected=is_connected,
         parse_target_ref_fn=_parse_target_ref,
         validate_target_ref_fn=_validate_target_ref,
-        # Dummy env var for keeping Topoi in cron delivery platform table (required by _is_known_delivery_platform)
+        # A registration marker, not a live env read: the plugin never writes TOPOI_HOME_TOPIC, but cron/scheduler_delivery.py::_is_known_delivery_platform counts a plugin platform as a valid delivery target only when this is non-empty, so clearing it silently drops deliver=topoi from the platform table.
         cron_deliver_env_var="TOPOI_HOME_TOPIC",
         standalone_sender_fn=_standalone_send,
         emoji="💬",

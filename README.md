@@ -4,14 +4,16 @@ Topoi groups every Hermes Agent chat under topics you defined in Hermes Desktop,
 
 ## Features
 
-- Sessions are grouped by topic as threads
-- View threads and create new ones from the sidebar
-- Search threads by message content from the topic tab
-- Deliver cron job results to topics without a separate messaging platform
-- Reply to cron job threads with continuable session context
-- Add existing sessions to a topic and move threads to a different one
-- Create and manage topics in both Desktop and Web Dashboard
-- Continue your chats on the go with [Topoi mobile app](https://github.com/AlaisterLeung/topoi-mobile)
+- **Sessions** - Group and organize your chat sessions by topic as threads
+- **Sidebar** - View recently active threads from the past week, and click the topic to see all
+- **Status dots** - A dot next to each thread indicating whether it's working, waiting on you, unread, or idle
+- **New chat** - Start one from the sidebar or the tab strip, and it files under your home topic (default: General)
+- **Search** - Find threads by message content from the topic tab
+- **Cron job display** - Deliver cron job results to topics without a separate messaging platform
+- **Reply to cron jobs** - Reply directly to threads created by the cron jobs with continuable session context
+- **Topics** - Create and manage topics in both Desktop settings and Web Dashboard
+- **Organization** - Add existing sessions to a topic and move threads to a different one
+- **Mobile app** - Continue your chats on the go with [Topoi mobile app](https://github.com/AlaisterLeung/topoi-mobile)
 
 ## Install
 
