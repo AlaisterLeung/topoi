@@ -55,6 +55,10 @@ import {
 } from "@hermes/plugin-sdk";
 import { useEffect, useRef, useState } from "react";
 import { jsx, jsxs } from "react/jsx-runtime";
+// Namespace import on purpose: a missing named export fails ESM linking and takes the
+// whole pane down, while a missing property is only undefined. The unread acks are read
+// from here behind typeof checks.
+import * as pluginSdk from "@hermes/plugin-sdk";
 
 // A topic section is a glance at recent activity: at most SECTION_THREADS
 // threads, and the head's label opens the topic tab for the full list.
@@ -69,6 +73,12 @@ const PANE_ACTIVE_MS = PANE_ACTIVE_DAYS * 24 * 60 * 60 * 1000;
 // A keystroke is not a query: the topic tab's search box waits out this gap, so
 // typing a word costs one page request instead of one per letter.
 const SEARCH_DEBOUNCE_MS = 220;
+// The sidebar's search is one whole-set request: the backend filters the entire
+// listing (transcript index, then title and preview) before paginating, so this
+// is how many rows a 280px pane shows, not how many matches exist.
+const SEARCH_LIMIT = 50;
+// One character is a whole-listing scan for nothing.
+const SEARCH_MIN_CHARS = 2;
 // The bind retries only long enough for the session row to appear: the app
 // writes it when the first prompt is processed, a moment after the re-home
 // that fired this filing. An id the app minted but never wrote a row for (a
@@ -108,7 +118,12 @@ const CSS = `
 .topoi-section-add:hover{background:var(--chrome-action-hover);color:var(--ui-text-secondary)}
 .topoi-section-head:hover .topoi-section-add{opacity:1}
 .topoi-section-add:focus-visible{opacity:1}
-.topoi-home-dot{width:5px;height:5px;border-radius:50%;background:var(--ui-accent);flex-shrink:0}
+.topoi-section-read{display:flex;flex-shrink:0;align-items:center;justify-content:center;width:20px;height:24px;padding:0;border:0;border-radius:4px;background:none;color:var(--ui-text-quaternary);cursor:pointer;opacity:0;transition:opacity 120ms ease}
+.topoi-section-read:hover{background:var(--chrome-action-hover);color:var(--ui-text-secondary)}
+.topoi-section-head:hover .topoi-section-read{opacity:1}
+.topoi-section-read:focus-visible{opacity:1}
+.topoi-section-read:disabled,.topoi-section-read:disabled:hover{opacity:0;background:none;cursor:default}
+.topoi-section-head:hover .topoi-section-read:disabled{opacity:0}
 .topoi-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px;padding:0 4px 0 8px}
 .topoi-row-main{display:flex;min-width:0;align-items:center;gap:6px;height:26px;padding:0 4px;text-align:left;border:0;border-radius:4px;background:none;color:var(--ui-text-primary);cursor:pointer}
 .topoi-row-main:hover{background:var(--chrome-action-hover)}
@@ -156,6 +171,14 @@ const CSS = `
 .topoi-edit{display:flex;align-items:center;gap:6px}
 .topoi-edit-name{flex:1;min-width:0}
 .topoi-edit-actions{display:flex;align-items:center;gap:2px}
+.topoi-find{flex:0 0 auto;display:flex;align-items:center;gap:4px;padding:0 8px 6px}
+.topoi-find-field{flex:1 1 auto;min-width:0}
+.topoi-find-button{display:flex;flex-shrink:0;align-items:center;justify-content:center;width:20px;height:24px;padding:0;border:0;border-radius:4px;background:none;color:var(--ui-text-quaternary);cursor:pointer}
+.topoi-find-button:hover{background:var(--chrome-action-hover);color:var(--ui-text-secondary)}
+.topoi-find-button:disabled{background:none;color:var(--ui-text-quaternary);cursor:default;opacity:0.4}
+.topoi-search-head{display:flex;flex:1;min-width:0;align-items:center;gap:6px;margin-left:4px;padding:0 4px;height:24px}
+.topoi-search-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.6875rem;font-weight:600;color:var(--ui-text-secondary)}
+.topoi-count{flex-shrink:0;padding-right:4px;font-size:0.625rem;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
 `;
 
 // Bound at register; null after unload/disable. Components read them per call.
@@ -382,6 +405,13 @@ const bindThread = (sessionId, topicId, move = false) =>
 const fetchCronResult = (sessionId) => rest(`/threads/${encodeURIComponent(sessionId)}/cron`);
 const deleteThread = (sessionId) =>
   rest(`/threads/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+// One read mark for both buttons. The ids are the rows the sidebar is showing, so
+// the client owns the scope: the backend stamps them and reports any it could not.
+// An empty set never becomes a request.
+const markThreadsRead = (sessionIds) =>
+  sessionIds && sessionIds.length > 0
+    ? rest("/threads/read", { method: "POST", body: { session_ids: sessionIds } })
+    : Promise.resolve({ ok: true, marked: 0, failed: [] });
 
 // The sidebar pane passes "in-place".
 // The row menu and the branch keep asking for their own intents.
@@ -1835,11 +1865,11 @@ function ThreadRow({
   });
 }
 
-// A topic's head row: the name opens the topic tab, and the caret plus the +
-// (a new chat filed under this topic) sit at the right of the name and
-// reveal on hover, the builtin sidebar's section affordance. The label keeps
-// the pane's own text colour and case.
-function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
+// A topic's head row: the name opens the topic tab, and the check, the caret and
+// the + (a new chat filed under this topic) sit at the right of the name and
+// reveal on hover, the builtin sidebar's section affordance. The label keeps the
+// pane's own text colour and case.
+function SectionHead({ entry, expanded, markable, marking, onMarkRead, onOpenTopic, onToggle }) {
   return jsxs("div", {
     className: "topoi-section-head",
     children: [
@@ -1851,13 +1881,26 @@ function SectionHead({ entry, expanded, homeId, onOpenTopic, onToggle }) {
         children: [
           // The head reserves the rows' own lead cell, so a topic's name and the
           // titles under it share one left edge instead of the rows starting
-          // 20px in from their own header.
-          jsx("span", {
-            className: "topoi-lead",
-            children: entry?.id === homeId && jsx("span", { className: "topoi-home-dot" }),
-          }),
+          // 20px in from their own header. The cell is empty on purpose: the
+          // class carries a fixed width, so the label keeps its column whether
+          // or not anything paints here.
+          jsx("span", { className: "topoi-lead" }),
           jsx("span", { className: "topoi-topic-label", children: entry?.name ?? entry?.id }),
         ],
+      }),
+      // Marks the rows this section is showing, never the topic's whole history:
+      // the ids come from the same visible slice the tree renders, so the button
+      // can never clear a thread nobody can see. Mounted even with nothing to
+      // mark, so the caret and the + sit at one x across every section.
+      jsx("button", {
+        "aria-busy": marking || undefined,
+        "aria-label": `Mark all threads in ${entry?.name ?? entry?.id} as read`,
+        className: "topoi-section-read",
+        disabled: !markable || Boolean(marking),
+        onClick: onMarkRead,
+        title: markable ? "Mark all as read" : "No threads to mark",
+        type: "button",
+        children: jsx(Codicon, { name: "check", size: "0.75rem" }),
       }),
       jsx("button", {
         "aria-expanded": expanded,
@@ -1891,18 +1934,43 @@ const isRecentThread = (thread, now) => {
   return stamp === 0 || now - stamp < PANE_ACTIVE_MS;
 };
 
-function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle, threads }) {
+// The rows a section actually shows. Both read buttons mark this set, so neither can
+// clear a row the tree does not render, and the cap is applied in one place.
+const visibleThreads = (threads, now) =>
+  (threads ?? [])
+    .filter((thread) => isRecentThread(thread, now))
+    .slice(0, SECTION_THREADS);
+
+function TopicSection({ entries, entry, expanded, onOpenTopic, onToggle, threads }) {
   const now = Date.now();
   // Recent threads only, and never more than SECTION_THREADS of them: older
   // rows and the overflow live in the topic tab, which the head opens.
-  const shown = threads.filter((thread) => isRecentThread(thread, now)).slice(0, SECTION_THREADS);
+  const shown = visibleThreads(threads, now);
+  // Section-local pending, independent of the global button's: `markRows` is called
+  // directly rather than through the tree's handler, so marking one topic never
+  // leaves the double-check disabled.
+  const [marking, setMarking] = useState(false);
+  const markShown = async () => {
+    if (marking) return;
+    setMarking(true);
+    try {
+      await markRows(shown);
+    } finally {
+      setMarking(false);
+    }
+  };
   return jsxs("div", {
     className: "topoi-section",
     children: [
       jsx(SectionHead, {
         entry,
         expanded,
-        homeId,
+        // The rows this section owns, cap and recency applied, whatever the fold is
+        // doing: a collapsed topic still has a mark to clear, and the button stays
+        // reachable from the keyboard while it is enabled.
+        markable: shown.length > 0,
+        marking,
+        onMarkRead: () => void markShown(),
         onOpenTopic: onOpenTopic ? () => onOpenTopic(entry) : undefined,
         onToggle,
       }),
@@ -1916,6 +1984,211 @@ function TopicSection({ entries, entry, expanded, homeId, onOpenTopic, onToggle,
             thread,
           }),
         ),
+    ],
+  });
+}
+
+// One whole-set search. The key sits under the ["topoi","threads"] prefix on
+// purpose: both existing invalidations (`["topoi"]` and `["topoi","threads"]`)
+// then refresh a live search for free, so a bind never leaves stale hits.
+const THREAD_SEARCH_KEY = (scope, needle) => [
+  "topoi",
+  "threads",
+  scope,
+  "search",
+  needle,
+];
+const fetchThreadSearch = (needle) =>
+  rest(`/threads?limit=${SEARCH_LIMIT}&offset=0&q=${encodeURIComponent(needle)}`);
+
+// A build that predates the unread acks gets told once instead of failing quietly.
+let missingAckWarned = false;
+const warnMissingAck = () => {
+  if (missingAckWarned) return;
+  missingAckWarned = true;
+  console.warn("[topoi] read mark: this desktop build exposes no unread ack; dots will lag");
+  host.notify({
+    kind: "error",
+    message: "Marked read, but this desktop build cannot clear the dots.",
+  });
+};
+
+// The dot has three sources: the watermark the route clears, a per-profile seen count,
+// and two renderer sets (durable unread markers plus a transient one for a session that
+// finished off screen). Core owns the last two, so ack through its own functions:
+// ackStoredSessionId matches the row by any lineage id, while forgetSessionUnread matches
+// bucket keys exactly and so needs the durable root as well as the tip.
+const ackLocalRead = (rows) => {
+  const ack = typeof pluginSdk.ackStoredSessionId === "function" ? pluginSdk.ackStoredSessionId : null;
+  const forget =
+    typeof pluginSdk.forgetSessionUnread === "function" ? pluginSdk.forgetSessionUnread : null;
+  if (!ack && !forget) {
+    // One-shot, user-visible: an absent export is otherwise indistinguishable from an
+    // ack that ran and did not help, and that ambiguity is what makes this take rounds.
+    warnMissingAck();
+    return;
+  }
+  const list = rows ?? [];
+  for (const thread of list) {
+    if (thread?.session_id && ack) {
+      try {
+        // No profile hint: the dot resolves through the active gateway profile, so
+        // omitting it acks the same bucket the dot paints from.
+        ack(thread.session_id);
+      } catch {
+        // An id core has no row for is core's to ignore - the watermark already landed.
+      }
+    }
+  }
+  const candidates = list
+    .flatMap((thread) => [thread?.session_id, thread?.lineage_root])
+    .filter(Boolean);
+  if (forget && candidates.length > 0) {
+    try {
+      forget(candidates);
+    } catch {
+      // Same rule: a stale id must never break the mark that already succeeded.
+    }
+  }
+};
+
+// The one write both read buttons share: mark the rows, refetch, and report a
+// partial when the backend could not write every id.
+async function markRows(rows) {
+  const list = rows ?? [];
+  const ids = list.map((thread) => thread.session_id).filter(Boolean);
+  if (ids.length === 0) return;
+  try {
+    const result = await markThreadsRead(ids);
+    // Rows, not ids: the ack needs the lineage root too. Before the refetch, so the
+    // repaint it triggers already sees the cleared dot.
+    ackLocalRead(list);
+    // Awaited so a caller's pending state spans the repaint, not just the POST.
+    await queryClient.invalidateQueries({ queryKey: ["topoi"] });
+    if (result && result.ok === false) {
+      host.notify({ kind: "error", message: `Marked ${result.marked} of ${ids.length} threads.` });
+    }
+  } catch (error) {
+    host.notifyError(error, "Could not mark the rows as read");
+  }
+}
+
+// The pane's pinned row: whole-set search plus the global read mark. A sibling of the
+// scroll box rather than a sticky child, so it is pinned by layout and needs no
+// background or z-index to stay put.
+function SearchRow({ markDisabled, marking, onClear, onMarkAll, onTyped, typed }) {
+  return jsxs("div", {
+    className: "topoi-find",
+    onKeyDown: (event) => {
+      if (event.key !== "Escape") return;
+      if (typed) onClear();
+      else event.target?.blur?.();
+    },
+    role: "search",
+    children: [
+      jsx(Input, {
+        "aria-label": "Search all threads",
+        className: "topoi-find-field",
+        onChange: (event) => onTyped(event.target.value),
+        placeholder: "Search all threads",
+        value: typed,
+      }),
+      typed &&
+        jsx("button", {
+          "aria-label": "Clear search",
+          className: "topoi-find-button",
+          onClick: onClear,
+          title: "Clear search",
+          type: "button",
+          children: jsx(Codicon, { name: "close", size: "0.75rem" }),
+        }),
+      // The double check marks every row the pane is showing - the union of each
+      // section's visible slice, or the hits while a search is up.
+      jsx("button", {
+        "aria-busy": marking || undefined,
+        "aria-label": "Mark all as read",
+        className: "topoi-find-button",
+        disabled: Boolean(marking) || Boolean(markDisabled),
+        onClick: onMarkAll,
+        title: markDisabled ? "No rows to mark" : "Mark all as read",
+        type: "button",
+        children: jsx(Codicon, { name: "check-all", size: "0.75rem" }),
+      }),
+    ],
+  });
+}
+
+// A result group's head: a label and a count, no controls. SectionHead is the wrong
+// shape here, since its caret and + have nothing to fold or file on results, and
+// reusing it would tempt a fold-map write from a search. The wrapper copies
+// `.topoi-topic`'s own box so a group label lands on the same left edge as the topic
+// labels above and below it.
+function SearchGroupHead({ count, entry }) {
+  return jsx("div", {
+    className: "topoi-section-head",
+    children: jsxs("span", {
+      className: "topoi-search-head",
+      children: [
+        jsx("span", { className: "topoi-lead" }),
+        jsx("span", { className: "topoi-search-name", children: entry?.name ?? entry?.id }),
+        jsx("span", { className: "topoi-count", children: count }),
+      ],
+    }),
+  });
+}
+
+// Hits replace the tree while a needle is up. Results never read or write the fold
+// map, and they bypass both the SECTION_THREADS cap and the recency window, so an
+// old transcript hit is visible instead of matched-but-hidden.
+function SearchResults({ entries, error, groups, loading, needle, total }) {
+  // Counted from the groups, not the raw hit list: a hit whose topic is no longer a
+  // live entry is dropped by groupThreads, so a raw count would promise rows that no
+  // group renders.
+  const shown = groups.reduce((count, group) => count + group.threads.length, 0);
+  if (error) {
+    return jsx("div", {
+      className: "topoi-note",
+      children: "The topoi backend could not be reached.",
+    });
+  }
+  if (loading) return jsx(EmptyState, { title: "Searching" });
+  if (groups.length === 0) {
+    return jsx(EmptyState, {
+      description: `No thread in a topic mentions "${needle}", in any message.`,
+      title: "No matches",
+    });
+  }
+  return jsxs("div", {
+    children: [
+      groups.map((group) =>
+        jsxs(
+          "div",
+          {
+            className: "topoi-section",
+            children: [
+              jsx(SearchGroupHead, { count: group.threads.length, entry: group.entry }),
+              group.threads.map((thread) =>
+                jsx(ThreadRow, {
+                  entries,
+                  // A transcript hit carries its matched line; a title-only match
+                  // has none, and the row leaves the tooltip off.
+                  hint: thread.match,
+                  key: thread.lineage_root,
+                  onOpen: (row) => openThread(row, "in-place"),
+                  showStatus: true,
+                  thread,
+                }),
+              ),
+            ],
+          },
+          group.entry.id,
+        ),
+      ),
+      total > shown &&
+        jsx("div", {
+          className: "topoi-note",
+          children: `Showing ${shown} of ${total}`,
+        }),
     ],
   });
 }
@@ -1937,22 +2210,61 @@ function TopicTree() {
   // expanded and the map stays small. An older map still reads correctly (a stored
   // `false` is folded, a stored `true` is open under `!== false`), so no migration.
   const [expanded, setExpanded] = useState(() => storage?.get("expanded", {}) ?? {});
-
-  if (topicsQuery.error || threadsQuery.error) {
-    return jsx(EmptyState, {
-      description:
-        "The topoi backend could not be reached. Check that the plugin is enabled on the gateway.",
-      title: "Topics unavailable",
-    });
-  }
-  if (topicsQuery.isLoading || threadsQuery.isLoading) {
-    return jsx(EmptyState, { title: "Loading topics" });
-  }
+  const [typed, setTyped] = useState("");
+  const [needle, setNeedle] = useState("");
+  const [marking, setMarking] = useState(false);
+  // A keystroke is not a query: the field follows every character, the request
+  // waits out the same gap the topic tab's search uses. The row stays mounted
+  // through the error and loading states, so a dead backend never takes the field
+  // away while it is being typed in.
+  useEffect(() => {
+    const next = typed.trim();
+    if (next.length < SEARCH_MIN_CHARS) {
+      setNeedle("");
+      return undefined;
+    }
+    const timer = setTimeout(() => setNeedle(next), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [typed]);
+  const searching = needle.length >= SEARCH_MIN_CHARS;
+  const searchQuery = useQuery({
+    // One character is a whole-listing scan for nothing.
+    enabled: searching,
+    // The last answer stays painted while the next lands, so typing never blanks
+    // the pane for a round trip.
+    placeholderData: (previous) => previous,
+    queryFn: () => fetchThreadSearch(needle),
+    queryKey: THREAD_SEARCH_KEY(scope, needle),
+    staleTime: 0,
+  });
 
   const entries = topicsQuery.data?.entries ?? [];
-  const homeId = topicsQuery.data?.home_id;
   const threads = threadsQuery.data?.threads ?? [];
   const groups = groupThreads(entries, threads);
+  const now = Date.now();
+  // The union of every section's visible slice. Fold-independent: a folded section still
+  // owns its rows, the same way its own check stays live, and an all-folded tree must not
+  // leave the global button disabled.
+  const visibleRows = groups.flatMap((group) => visibleThreads(group.threads, now));
+  const hits = searchQuery.data?.threads ?? [];
+  // An empty head per registry entry is the tree's shape; a result list shows only the
+  // topics that matched.
+  const hitGroups = groupThreads(entries, hits).filter((group) => group.threads.length > 0);
+  // What a search actually renders: `hits` minus any row whose topic is no longer a
+  // live entry, which groupThreads drops. Counting raw hits would enable the button
+  // over a row nobody can see, while the body says "No matches".
+  const shownHits = hitGroups.flatMap((group) => group.threads);
+  const failed = Boolean(topicsQuery.error || threadsQuery.error);
+  const loading = topicsQuery.isLoading || threadsQuery.isLoading;
+  const markVisible = async (rows) => {
+    if (marking) return;
+    setMarking(true);
+    try {
+      await markRows(rows);
+    } finally {
+      setMarking(false);
+    }
+  };
   // Absence means open, so the map is the exception list rather than a state for
   // every topic. `current` is the value inside the updater, never the render's
   // `expanded`, or a burst of clicks would fold from a stale read. Opening deletes
@@ -1967,34 +2279,79 @@ function TopicTree() {
       return next;
     });
 
+  // The tree keeps its shipped shape: one TopicSection per registry entry, then
+  // the zero-thread state. Keyed by topic id, because TopicSection holds its own
+  // pending state.
+  const tree = [
+    groups.map((group) =>
+      jsx(
+        TopicSection,
+        {
+          entries,
+          entry: group.entry,
+          expanded: isOpen(group.entry.id),
+          onOpenTopic: openTopicTab,
+          onToggle: () => toggle(group.entry.id),
+          threads: group.threads,
+        },
+        group.entry.id,
+      ),
+    ),
+    threads.length === 0 &&
+      jsx(
+        EmptyState,
+        {
+          description: "Threads show up here once a chat is added to a topic.",
+          title: "No threads yet",
+        },
+        "empty",
+      ),
+  ];
+
+  // The pinned row is a sibling of the scroll box, so it never scrolls with the tree.
+  // The body branches: hits while a needle is up, the tree otherwise, and the error and
+  // loading states render inside the scroll area rather than replacing the pane, so a
+  // dead backend does not take the search field away with it.
+  const body = searching
+    ? jsx(SearchResults, {
+        entries,
+        error: searchQuery.error,
+        groups: hitGroups,
+        loading: Boolean(searchQuery.isLoading && !searchQuery.data),
+        needle,
+        total: searchQuery.data?.total ?? hits.length,
+      })
+    : failed
+      ? jsx(EmptyState, {
+          description:
+            "The topoi backend could not be reached. Check that the plugin is enabled on the gateway.",
+          title: "Topics unavailable",
+        })
+      : loading
+        ? jsx(EmptyState, { title: "Loading topics" })
+        : tree;
+
   return jsxs("div", {
     className: "topoi-tree",
     children: [
-      jsxs(ScrollArea, {
-        className: "topoi-scroll",
-        children: [
-          groups.map((group) =>
-            jsx(
-              TopicSection,
-              {
-                entries,
-                entry: group.entry,
-                expanded: isOpen(group.entry.id),
-                homeId,
-                onOpenTopic: openTopicTab,
-                onToggle: () => toggle(group.entry.id),
-                threads: group.threads,
-              },
-              group.entry.id,
-            ),
-          ),
-          threads.length === 0 &&
-            jsx(EmptyState, {
-              description: "Threads show up here once a chat is added to a topic.",
-              title: "No threads yet",
-            }),
-        ],
+      // Visible rows only, matching the per-topic check. While a search is up the tree
+      // is replaced by results, so the rendered hits are what the pane shows then. A
+      // failed listing renders no rows at all, so it disables rather than acting on
+      // cached data.
+      jsx(SearchRow, {
+        // A failed search keeps its old hits as `placeholderData`, so the error gate
+        // is what stops this enabling over rows the body has already replaced.
+        markDisabled:
+          failed ||
+          Boolean(searching && searchQuery.error) ||
+          (searching ? shownHits.length : visibleRows.length) === 0,
+        marking,
+        onClear: () => setTyped(""),
+        onMarkAll: () => void markVisible(searching ? shownHits : visibleRows),
+        onTyped: setTyped,
+        typed,
       }),
+      jsx(ScrollArea, { className: "topoi-scroll", children: body }),
     ],
   });
 }

@@ -92,6 +92,7 @@ All routes mount under `/api/plugins/topoi/`, behind the dashboard's normal auth
 - `topic_id` - a live registry entry
 - `title`, `latest_message`, `started_at`, `last_active`, `message_count`, `source`
 - `cron_result`, `cron_kind`, `replyable` - the reader flags below
+- `unread` - the verdict from core's read watermark, `sessions.last_read_at`: one epoch-seconds timestamp stamped across a whole compression lineage, where unread means activity newer than the stamp. True when the newest activity postdates it, false when the column is NULL (never tracked reads as read). It is the dashboard-visible half only; the dot also reads core's per-profile seen count and two marker sets, which a client clears locally.
 
 `latest_message` is the newest user or assistant text of the thread, whitespace-collapsed to one line and capped at a row-preview width, so a client can render two-line rows without a second call. It is deliberately not the store's own `preview` column: that one is the session's opening user prompt, which answers a title lookup but never the "what happened last" a listing row shows. Tool rows are skipped and the read pages back from the newest row, so the field costs one bounded read per listed row.
 
@@ -114,15 +115,23 @@ Re-filing a session that already sits under another topic needs `{session_id, to
 
 `DELETE /threads/{session_id}` deletes one thread. The row, its compression chain and its on-disk transcripts go through the core's own session delete - the same handler the desktop's own delete rides - so an already-absent session is a no-op success and a session under an active turn is a 409. The thread's binding is resolved from its lineage root before the row goes and dropped in the same call, so a deleted thread never leaves a binding behind.
 
-### 3.6 Broadcasts
+### 3.6 `POST /threads/read`
+
+`POST /threads/read` with `{session_ids: [...]}` clears the unread watermark on the named threads. Both sidebar read buttons ride it, and the client owns the scope: it sends the ids it is showing, so the route never guesses a topic's set. Ids are deduplicated, non-string entries are dropped, and the answer is `{ok, marked, failed}`, where a per-id refusal (a deleted session, an id from another profile) lands in `failed` with `ok: false` rather than aborting the rest. 422 on a missing, non-list, empty or over-long (500) id list.
+
+The stamp is the same `sessions.last_read_at` watermark, so the tip and its root agree and a client never has to know which id it held. That field backs the builtin sidebar, the status dot and `GET /threads`'s `unread` flag, so the clear is shared rather than plugin-private. A dot also carries renderer state that only the client can clear, which is why the desktop half acks its own copy after this call. `last_read_at` sits in core's change-watcher digest, so every open client hears `sessions.changed` and repaints without a plugin broadcast.
+
+This bypasses core's fenced mutation path: no `request_id` receipt, and no `$unreadWriteGuard`, so an in-flight `session.list` page can briefly repaint an old dot, and a message landing mid-click is marked read. The write never touches `runtime_revision`, so it cannot wedge a later fenced mutation on that session.
+
+### 3.7 Broadcasts
 
 Every registry write broadcasts `plugin.topoi.topics.changed`. Bindings need no broadcast: resolution is server-side on every `GET /threads`, so a binding is visible to every client the moment it lands. The thread list needs no plugin-side push either: a client refetches on the gateway's own `sessions.changed` event.
 
-### 3.7 The dashboard client
+### 3.8 The dashboard client
 
 The dashboard extension (`dashboard/manifest.json` + `dashboard/dist/index.js`) is the web-dashboard client of this surface: the registry CRUD at `/topics`, and a compact topic overview injected into the Sessions page through the `sessions:top` slot. The dashboard shell renders plugin tabs in a separate Plugins section at the end of the sidebar, so `tab.position: after:sessions` orders the Topics tab first among the plugin tabs rather than literally after the built-in Sessions tab. The tab's Recent Threads card lists only threads filed under a live topic, caps each topic group at `RECENT_PER_TOPIC` (3, matching the desktop sidebar's `SECTION_THREADS`; the sidebar additionally drops threads older than 7 days, the card does not), and its heading total counts exactly those threads. A thread whose `topic_id` names a topic that is no longer a live entry is therefore not listed there at all, and its binding is not resurrected by anything.
 
-### 3.8 `GET /threads/{session_id}/cron`
+### 3.9 `GET /threads/{session_id}/cron`
 
 One cron result as a document, for a client that renders it instead of opening a chat. The path is `/cron` because the run is the core component and a briefing is one kind of run.
 

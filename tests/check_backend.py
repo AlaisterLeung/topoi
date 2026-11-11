@@ -1,6 +1,6 @@
 """Backend route check for the topoi REST surface (real router handlers, real store, throwaway HERMES_HOME).
 
-Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, and the delete route (row gone, binding dropped). The store logic (set / clear / prune / sweep) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
+Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, the delete route (row gone, binding dropped), and the read mark (the watermark clearing across a compression chain, an absent id reported rather than raised, and the route's own body cleanup). The store logic (set / clear / prune / sweep) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
 
     ~/.hermes/hermes-agent/venv/bin/python tests/check_backend.py
 
@@ -169,6 +169,11 @@ def main() -> int:
         "sess_plain_tip" not in by_root
         and by_root["sess_plain"]["session_id"] == "sess_plain_tip",
         threads["threads"],
+    )
+    check(
+        "a listed row carries core's unread flag",
+        all(isinstance(row.get("unread"), bool) for row in threads["threads"]),
+        [row.get("unread") for row in threads["threads"]],
     )
     check(
         "an adapter-minted session resolves its topic from chat_id",
@@ -808,6 +813,87 @@ def main() -> int:
         unarchive_seed.set_session_archived("sess_seed_key", False)
     finally:
         unarchive_seed.close()
+
+    # ---- the read mark: core's own watermark, never a plugin-side table --------------------------
+    # Fixtures of its own, in the store this block stamps: the rows above belong to the delete and
+    # archive blocks, and reusing them would make this check depend on their order.
+    read_db = SessionDB()
+    try:
+        read_db.create_session("sess_read", "local", chat_id="")
+        read_db.end_session("sess_read", "compression")
+        read_db.create_session(
+            "sess_read_tip", "local", chat_id="", parent_session_id="sess_read"
+        )
+        read_db.set_session_read("sess_read", False)
+        root_row = read_db.get_session("sess_read")
+        check(
+            "a zeroed watermark reads as unread",
+            root_row is not None and read_db.session_unread(root_row) is True,
+        )
+        marked = api._mark_threads_read(read_db, ["sess_read"])
+        check(
+            "the read mark clears the watermark",
+            marked["ok"] is True and marked["marked"] == 1 and marked["failed"] == [],
+            marked,
+        )
+        cleared = read_db.get_session("sess_read")
+        check(
+            "a cleared row reads as read",
+            cleared is not None and read_db.session_unread(cleared) is False,
+        )
+        # The bidirectional lineage walk is what makes a tip id unnecessary: root and compression
+        # continuation share one watermark, so a client may send whichever id its row held.
+        read_db.set_session_read("sess_read_tip", False)
+        followed = read_db.get_session("sess_read")
+        check(
+            "the watermark is shared across the compression chain",
+            followed is not None and read_db.session_unread(followed) is True,
+            "the root did not follow the continuation",
+        )
+        api._mark_threads_read(read_db, ["sess_read"])
+        tip_cleared = read_db.get_session("sess_read_tip")
+        check(
+            "marking the root clears its continuation",
+            tip_cleared is not None and read_db.session_unread(tip_cleared) is False,
+        )
+        absent = api._mark_threads_read(read_db, ["sess_no_such_row"])
+        check(
+            "an absent id is reported rather than raised",
+            absent["ok"] is False
+            and absent["marked"] == 0
+            and absent["failed"] == ["sess_no_such_row"],
+            absent,
+        )
+    finally:
+        read_db.close()
+
+    # The route's own half: body cleanup, and the no-owner branch `_write_db` takes, which opens our
+    # own writable handle and then releases it.
+    read_route = types.SimpleNamespace(
+        state=types.SimpleNamespace(),
+        app=types.SimpleNamespace(state=types.SimpleNamespace(gateway_runner=None)),
+    )
+    deduped = asyncio.run(
+        api.mark_threads_read(
+            {"session_ids": ["sess_read", "sess_read", None, 7, "   "]}, read_route
+        )
+    )
+    check(
+        "the read route dedupes ids and drops non-strings",
+        deduped["marked"] == 1 and deduped["failed"] == [],
+        deduped,
+    )
+    for bad_body in ({}, {"session_ids": []}, {"session_ids": "sess_plain"}, []):
+        try:
+            asyncio.run(api.mark_threads_read(bad_body, read_route))
+        except api.HTTPException as exc:
+            check(
+                f"the read route refuses {bad_body!r}",
+                exc.status_code == 422,
+                exc.status_code,
+            )
+        else:
+            check(f"the read route refuses {bad_body!r}", False, "no error")
 
     print()
     if failures:

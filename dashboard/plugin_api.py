@@ -8,6 +8,7 @@ Routes (CONTRACT.md section 3):
 - ``PUT /topics`` - store a client-sent registry; 422 with the refusal reason on a bad one.
 - ``GET /threads`` - session rows resolved to topics (adapter-minted ``chat_id``, then the binding store, then a cron run's own job delivery lane), paged, newest first; only threads filed under a live topic are listed.
 - ``POST /threads/bind`` - file one session under a topic; re-filing one that is already filed elsewhere needs ``move: true`` (the row menu's Move to topic), so a client-side misfire cannot relocate a thread (409 otherwise).
+- ``POST /threads/read`` - clear the unread watermark on the ids a client sends: core's own ``sessions.last_read_at``, the field the builtin sidebar and the status dot read.
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
 - ``GET /threads/{session_id}/cron`` - one cron result as a document: a mirrored run thread's brief or a run's final answer, plus whether a reply can land and where.
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -34,6 +36,9 @@ PLATFORM_NAME = "topoi"
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_LIMIT = 200
 _MAX_LIMIT = 500
+# A read mark names its ids, so the cap is a body-size guard rather than a page: a caller sends one
+# topic's visible slice, or the union of every section's slice, or the rendered search hits.
+_MAX_READ_IDS = 500
 # The sources the dashboard itself hides from human listings (kanban board and tool runs); the topic list mirrors that so a topic tree never shows machinery sessions.
 _HIDDEN_SOURCES = ("kanban", "tool")
 
@@ -191,6 +196,66 @@ def _open_db(profile: str | None):
     from hermes_cli.web_server_sessions import _open_session_db_for_profile
 
     return _open_session_db_for_profile(profile or None, read_only=True)
+
+
+def _open_write_db(profile: str | None):
+    """A writable handle on the same store, for the read-mark route.
+
+    The read-only opener above stays the default. Only the watermark write needs this, and it opens
+    without the offline maintenance lock, which a gateway owning the store would refuse.
+    """
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile
+
+    return _open_session_db_for_profile(profile or None, read_only=False)
+
+
+def _write_db(request: Request, profile: str | None) -> tuple[Any, bool]:
+    """The store to stamp watermarks on, plus whether the caller must close it.
+
+    A composed gateway is the store's only writer, so its own connection answers first; that handle is
+    borrowed for the request and never closed here. With no owner the route opens a writable
+    connection and hands it back through ``release_or_close``. A plain ``close`` would tear the shared
+    generation down under the gateway and any live turn.
+
+    The owner probe is a private core seam, and the dashboard and gateway can sit on different core
+    revisions mid-update, so a probe that cannot run falls back to our own handle rather than failing
+    the button.
+    """
+    try:
+        from hermes_cli.web_routers.sessions import _owner_db_for
+
+        owner = _owner_db_for(request, profile)
+        if owner is not None:
+            return owner, False
+    except (ImportError, AttributeError):
+        # A core revision that moved the seam degrades instead of 500ing the button. A real failure
+        # still propagates: falling through would open the second writer this probe exists to avoid.
+        logger.warning(
+            "topoi: owner store probe unavailable; opening our own handle",
+            exc_info=True,
+        )
+    return _open_write_db(profile), True
+
+
+def _mark_threads_read(db: Any, session_ids: list[str]) -> dict[str, Any]:
+    """Clear the read watermark on each id.
+
+    ``last_read_at`` is lineage-stamped, so the tip and every id in its compression chain agree and a
+    client never has to know which one it held. An id the store will not write (a deleted session, an
+    id from another profile) lands in ``failed`` rather than raising, so one stale row never aborts a
+    whole mark.
+    """
+    marked = 0
+    failed: list[str] = []
+    for session_id in session_ids:
+        try:
+            if db.set_session_read(session_id, True):
+                marked += 1
+            else:
+                failed.append(session_id)
+        except sqlite3.Error:
+            failed.append(session_id)
+    return {"ok": not failed, "marked": marked, "failed": failed}
 
 
 # A cron run session is minted by the scheduler as `cron_<job id>_<stamp>`; the id
@@ -731,6 +796,10 @@ async def get_threads(
                         "session_id": tip,
                         "lineage_root": root,
                         "topic_id": topic_id,
+                        # Core's watermark verdict: unread when activity postdates
+                        # `last_read_at`. The dot adds renderer state on top, so a control
+                        # dims on its own pending state, never on this flag alone.
+                        "unread": bool(row.get("unread")),
                         "title": str(row.get("title") or "").strip()
                         or _seed_title(row, job_index, thread_jobs),
                         "latest_message": _latest_message(db, tip),
@@ -861,6 +930,61 @@ async def bind_thread(
         raise HTTPException(status_code=422, detail=str(error)) from error
     finally:
         db.close()
+
+
+@router.post("/threads/read")
+async def mark_threads_read(
+    body: dict[str, Any], request: Request, profile: str | None = None
+) -> dict[str, Any]:
+    """Clear the unread watermark on a set of threads.
+
+    The client owns the scope: the sidebar sends the ids it is showing, so the route never guesses a
+    topic's set. ``sessions.last_read_at`` is core's own lineage-stamped watermark, the field the
+    builtin sidebar and the status dot read, so the clear is shared rather than plugin-private. A dot
+    also carries renderer state that only the client can clear, so the desktop half acks its own copy
+    alongside this call.
+
+    The write skips core's mutation fence, carrying no ``request_id`` and no ``expected_revision``, and
+    never touches ``runtime_revision``, so it cannot wedge a later fenced mutation on that session. In
+    exchange there is no receipt and no ``$unreadWriteGuard``: an in-flight ``session.list`` page can
+    briefly repaint an old dot, and a message landing mid-click is marked read. It is also the only
+    plugin-side write to the session store. Behind a composed gateway ``_write_db`` borrows the
+    owner's connection, but a dashboard process serving a store its gateway also writes is a second
+    writer, so a busy store answers 503 instead of retrying.
+
+    422 on an empty or over-long id list. Per-id failures come back in ``failed`` rather than raising.
+    """
+    raw = (body or {}).get("session_ids")
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=422, detail="session_ids must be a list")
+    # Only real strings count: coercing would turn a JSON null into the id "None" and report it as a
+    # failed row instead of a bad body.
+    ids = list(
+        dict.fromkeys(
+            value.strip() for value in raw if isinstance(value, str) and value.strip()
+        )
+    )
+    if not ids:
+        raise HTTPException(status_code=422, detail="session_ids is required")
+    if len(ids) > _MAX_READ_IDS:
+        raise HTTPException(
+            status_code=422, detail=f"at most {_MAX_READ_IDS} session ids per call"
+        )
+    db, owned = _write_db(request, profile)
+    try:
+        # Synchronous on purpose: `bind_thread` and `delete_thread` do their store work inline too, and
+        # a thread hop would let a cancelled request release the handle while the worker is still
+        # writing. The set is a handful of single-row updates.
+        return _mark_threads_read(db, ids)
+    except sqlite3.Error as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        if owned:
+            # A writable open is registry-managed, so a plain close would tear the shared generation
+            # down under the gateway and any live turn.
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
 
 
 @router.delete("/threads/{session_id}")
