@@ -55,7 +55,7 @@ Moving the home topic also rewrites the framework's `home_channel` projection, s
 
 Create a topic, then start a chat: it files under your home topic. Open a topic to see its threads, search inside one, or move a thread somewhere else. When a cron job delivers, its thread appears in the target topic, and replying there continues that run's session.
 
-Nothing new to learn. The plugin gives the sidebar, the tab strip and the Topics tab their behaviour, and you keep chatting the way you already do.
+Nothing new to learn. The plugin gives the sidebar and the Topics tab their behaviour, and you keep chatting the way you already do.
 
 ## How it works
 
@@ -80,7 +80,7 @@ The gateway owns one copy of the registry. Both clients read and write it over R
 | `dashboard/manifest.json` | the Dashboard extension manifest: tab, slot, entry, API |
 | `dashboard/plugin_api.py` | the REST API at `/api/plugins/topoi/` |
 | `dashboard/dist/index.js` | dashboard bundle: the Topics tab and the Sessions overview card |
-| `desktop/plugin.js` | the Hermes Desktop half: sidebar, tab strip, settings pages |
+| `desktop/plugin.js` | the Hermes Desktop half: sidebar, topic tabs, settings pages |
 | `skills/cron-delivery/` | the bundled `topoi:cron-delivery` skill |
 | `tests/` | Python check scripts, see Development |
 
@@ -119,6 +119,7 @@ The checks run against a throwaway `HERMES_HOME` and need no live gateway:
 ~/.hermes/hermes-agent/venv/bin/python tests/check_adapter.py
 ~/.hermes/hermes-agent/venv/bin/python tests/check_backend.py
 ~/.hermes/hermes-agent/venv/bin/python tests/check_cron_thread.py
+~/.hermes/hermes-agent/venv/bin/python tests/check_dashboard_bundle.py
 ```
 
 On an install that owes a `hermes update`, the launcher re-runs these on the managed runtime with `-I`, which drops the venv's site-packages and fails at `import yaml`. Prefix `HERMES_DISABLE_LAZY_INSTALLS=1` to skip that relaunch.

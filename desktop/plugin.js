@@ -10,12 +10,12 @@
 // into ctx.storage, so an app restart or a plugin reload restores it; the
 // bind waits out the session row's lazy write, and it only ever files a
 // chat that did not exist when the arm was set - the topic tab's Add to
-// topic action files an existing chat that flow missed. A click made while
-// ANY open tab holds a chat with no turns ADOPTS that chat (the strip's "+"
-// mints exactly such a chat, and so does the primary pane's empty draft), so
-// the new thread lands in an empty tab the user already has instead of
-// stacking another one. The row menu's Move to topic re-files a thread under
-// another topic, the same bind with a new target.
+// topic action files an existing chat that flow missed. A chat with no turns
+// is adopted where the app shows it: the focused chat, or the primary pane's
+// empty draft. A click made from a real conversation asks the app for a New
+// session (the same action as its New session row and ⌘N), so the new thread
+// lands in a draft of its own. The row menu's Move to topic re-files a thread
+// under another topic, the same bind with a new target.
 //
 // A new chat is filed under the home topic by default, including one the app
 // minted without a click in this pane. The mechanics live in "the home default"
@@ -138,7 +138,7 @@ const CSS = `
 .topoi-reader-markdown .aui-md > :last-child{margin-bottom:0}
 .topoi-reader-markdown .aui-md :where(p){margin-block:0.7rem 0}
 .topoi-reader-markdown .aui-md :where(h1,h2,h3,h4){margin-block:1rem 0.25rem}
-.topoi-reader-markdown .aui-md [data-slot='aui_markdown-image'] :where(img){margin:0}
+.topoi-reader-markdown .aui-md :where(img){margin:0}
 .topoi-reader-note{width:min(86%,44rem);margin:0 auto;padding:12px 8px 40px;font-size:0.75rem;color:var(--ui-text-tertiary)}
 .topoi-reader-reply{color:var(--theme-neutral-chrome)}
 .topoi-row-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.75rem}
@@ -184,6 +184,9 @@ const CSS = `
 // Bound at register; null after unload/disable. Components read them per call.
 let rest = null;
 let storage = null;
+// The app's own built-in actions (ctx.runAction), bound at register. Absent on a
+// desktop older than the action door, which is why every call site degrades.
+let runAction = null;
 
 // The topic tabs this plugin has open, keyed by topic id: closed on unload.
 const topicTabs = new Map();
@@ -236,6 +239,14 @@ const $pendingThread = atom(null);
 // and is never pruned on purpose: the set is small, and a pruned id that came
 // back would misfile.
 const ownChatIds = new Set();
+
+// Chat ids the app has SHOWN since this plugin loaded. Only ever an exclusion
+// set - "ids a mint must not be mistaken for" - so a superset is the safe
+// direction: a closed tab leaves no trace here and an extra id costs nothing.
+// Never adoption candidates (a closed tab's id must not be adopted), and not
+// ownChatIds: that set means "this plugin opened it", which changes the home
+// default's arming, not mint detection.
+const liveChatIds = new Set();
 
 // The atom is the live copy and ctx.storage the durable mirror, so an app
 // restart or a desktop-plugin reload inside the arm's life restores it
@@ -917,104 +928,19 @@ const isUnstarted = (lookup, sessionId, trustUnreadable = false) => {
   return lookup.answered || trustUnreadable;
 };
 
-// Core's tab-strip "+" (the same action as ⌘T). Pressing it is the only
-// plugin-side door to a WORKING fresh chat tab: the app mints the session, docks
-// the tile and patches the runtime id into it, and that patch has no SDK door -
-// a plugin that mints its own session and calls host.openSession('tab') leaves
-// the tile hydrating a row that does not exist yet, which latches "Session
-// unavailable". Core chrome is not a plugin surface, so every step below is by
-// DOM shape and any miss returns false, where the caller keeps the app's own
-// new-chat draft. The shapes: a strip carries `data-zone-tabstrip`, its tabs
-// `data-tree-tab` (`workspace`, or `session-tile:<stored id>`), and the chat
-// strip's glyph is the one button in that strip wrapping an `i.codicon-add`.
-const stripTabIds = (strip) =>
-  [...strip.querySelectorAll("[data-tree-tab]")].map(
-    (tab) => tab.getAttribute("data-tree-tab") ?? "",
-  );
-
-// Core's chat panes: `workspace` is the primary chat, `session-tile:<stored id>`
-// is one chat's own tab. Every other pane id in a strip is chrome.
-const TILE_PANE_PREFIX = "session-tile:";
-
-const isChatStrip = (strip) =>
-  stripTabIds(strip).some(
-    (paneId) => paneId === "workspace" || paneId.startsWith(TILE_PANE_PREFIX),
-  );
-
-const stripAddButton = (strip) =>
-  [...strip.querySelectorAll("button")].find((button) => button.querySelector("i.codicon-add")) ??
-  null;
-
-function pressNewChatTab() {
-  if (typeof document === "undefined") return false;
-  const strips = [...document.querySelectorAll("[data-zone-tabstrip]")].filter(isChatStrip);
-  if (strips.length === 0) return false;
-  // A split holds several chat strips: the one carrying the focused chat's tab
-  // answers, else the first. The press itself is what aims core at that zone.
-  const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
-  const strip =
-    strips.find((candidate) => stripTabIds(candidate).includes(`${TILE_PANE_PREFIX}${focused}`)) ??
-    strips[0];
-  const button = stripAddButton(strip);
-  if (!button) return false;
-  // pointerdown FIRST: the wrapper's capture handler is what tells core which
-  // zone the new tab belongs to, and the button's own handler stops the event
-  // before the strip's drag logic sees it.
-  try {
-    const Press = globalThis.PointerEvent ?? globalThis.MouseEvent;
-    button.dispatchEvent(
-      new Press("pointerdown", { bubbles: true, button: 0, buttons: 1, cancelable: true }),
-    );
-  } catch {
-    // A host without PointerEvent: the click still mints the tab.
+// A fresh chat through the app's own door: `session.new`, the action the sidebar's
+// New session row and the ⌘N shortcut run. It lands a draft in the workspace pane,
+// because core docks a tab only for `session.newTab`, which is not allowlisted yet.
+// A desktop without the action keeps its own draft, and the caller arms nothing.
+function startNewChat() {
+  if (runAction) {
+    const result = runAction("session.new");
+    if (result?.ok === true) return true;
   }
-  button.click();
-  return true;
-}
-
-// Every chat tab the app has open, by stored id, read off the strips' own tab
-// elements. The primary chat is a `workspace` pane with no stored id of its own,
-// so it is answered by primaryDraftOnScreen instead.
-function openChatTabIds() {
-  if (typeof document === "undefined") return [];
-  const ids = [];
-  for (const strip of document.querySelectorAll("[data-zone-tabstrip]")) {
-    if (!isChatStrip(strip)) continue;
-    for (const paneId of stripTabIds(strip)) {
-      if (!paneId.startsWith(TILE_PANE_PREFIX)) continue;
-      const sessionId = paneId.slice(TILE_PANE_PREFIX.length);
-      if (sessionId && !ids.includes(sessionId)) ids.push(sessionId);
-    }
-  }
-  return ids;
-}
-
-// Fronts an already-open chat tab. The press is core's own tab activation
-// (pointerdown first, the same capture-phase zone note the strip "+" needs), and
-// `host.openSession` is the fallback for a desktop whose tab elements this plugin
-// cannot find - `intent: 'tab'` fronts an OPEN tile, and only an unopened id
-// would hydrate over REST, which a rowless draft must never do.
-function frontChatTab(sessionId) {
-  const tab =
-    typeof document === "undefined"
-      ? null
-      : document.querySelector(`[data-tree-tab="${TILE_PANE_PREFIX}${sessionId}"]`);
-  if (tab) {
-    try {
-      const Press = globalThis.PointerEvent ?? globalThis.MouseEvent;
-      tab.dispatchEvent(
-        new Press("pointerdown", { bubbles: true, button: 0, buttons: 1, cancelable: true }),
-      );
-    } catch {
-      // A host without PointerEvent: the click still fronts the tab.
-    }
-    tab.click();
+  if (typeof host.newChat === "function") {
+    host.newChat();
     return true;
   }
-  const profile = activeProfile();
-  void host
-    .openSession(sessionId, { intent: "tab", ...(profile ? { profile } : {}) })
-    .catch(() => {});
   return false;
 }
 
@@ -1027,21 +953,22 @@ function primaryDraftOnScreen(focused) {
   return host.paneVisibility("workspace")?.get?.() === true;
 }
 
-// Files the chat this click adopted. The arm carries the chat's own id, so the
-// focus watcher skips it and fileAdoptedTab owns the filing; a tab the user is
-// not looking at is fronted first, so the thread lands where they will type.
-function adoptChat(sessionId, entry, name, front) {
+// Arms the chat this click adopted. The arm carries its id, so the focus watcher skips it
+// and the first turn files it.
+function adoptChat(sessionId, entry, name) {
   setPendingThread({
     at: Date.now(),
+    // Nothing typed yet, so wait for the first turn. Binding now would file an empty thread
+    // and clear the hint; a restored arm keeps fileAdoptedTab because it may have turns.
+    awaitTurn: true,
     known: null,
     seenId: sessionId,
     sessionId,
     topicId: entry.id,
     topicName: name,
   });
-  if (front) frontChatTab(sessionId);
   host.composer?.focus?.(sessionId);
-  fileAdoptedTab(sessionId, entry.id, name);
+  void settleHomeArm();
 }
 
 // Arms the primary pane's own unstarted draft: no tab is minted, so the thread
@@ -1067,17 +994,14 @@ function adoptPrimaryDraft(entry, name) {
   host.composer?.focus?.("new");
 }
 
-// A New thread click. ANY open tab holding a chat with no turns IS the new
-// thread, whether it is the tab in front or one behind another (Boss,
-// 2026-10-27: "whether in front or not does not matter"): the click adopts it
-// and files it on the first send through fileThread's row-write retry, instead
-// of stacking a second empty tab. That covers the app's own "New session" tab -
-// the strip's "+" and ⌘T mint a chat with no turns - and the primary chat's
-// empty draft, which is the tab the app shows on start and after the last one
-// closes. Only a click made from a real conversation opens a tab of its own, by
-// pressing core's own strip button.
+// A New thread click. ANY chat with no turns that the app is SHOWING is the new
+// thread: the focused chat when it is unstarted, and the primary chat's empty
+// draft (Boss, 2026-10-27: "whether in front or not does not matter"). The click
+// adopts it and files it on the first send through fileThread's row-write retry,
+// instead of stacking a second empty chat. A click made from a real conversation
+// asks the app for a New session, which lands a draft in the workspace pane.
 async function startNewThread(entry) {
-  if (typeof host.newChat !== "function") {
+  if (!runAction && typeof host.newChat !== "function") {
     host.notify({ kind: "error", message: "Update Hermes Desktop to start a chat." });
     return;
   }
@@ -1085,16 +1009,12 @@ async function startNewThread(entry) {
   const at = Date.now();
   const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
   const lookup = await loadTurnLookup();
+  // The topic `+` on an untitled chat is a topic change, not a request for
+  // another chat: adopt what is focused. Fronting an open tile, if a caller ever
+  // needs it: host.openSession(id, {intent: "tab"}).
   if (focused && isUnstarted(lookup, focused, true)) {
-    adoptChat(focused, entry, name, false);
+    adoptChat(focused, entry, name);
     return;
-  }
-  for (const sessionId of openChatTabIds()) {
-    if (sessionId === focused) continue;
-    if (isUnstarted(lookup, sessionId)) {
-      adoptChat(sessionId, entry, name, true);
-      return;
-    }
   }
   if (primaryDraftOnScreen(focused)) {
     adoptPrimaryDraft(entry, name);
@@ -1117,11 +1037,12 @@ async function startNewThread(entry) {
       setPendingThread({ ...pending, known });
     }
   });
-  // A tab of its own when the click came from a real conversation: core's own
-  // strip button is pressed (it mints, docks and patches the runtime), and a
-  // desktop whose strip this plugin cannot find keeps the app's new-chat draft.
-  if (!pressNewChatTab()) {
-    host.newChat();
+  // A draft of its own when the click came from a real conversation. The action
+  // is the app's own New session, so a desktop without it says so instead of
+  // leaving the user in a chat that never appears.
+  if (!startNewChat()) {
+    setPendingThread(null);
+    host.notify({ kind: "error", message: "Update Hermes Desktop to start a chat." });
   }
 }
 
@@ -1168,7 +1089,11 @@ async function fileThread(sessionId, topicId, topicName, stillWanted = null) {
         return;
       }
       if (!isMissingSession(error)) {
-        console.warn("[topoi] could not file the new thread under", topicName || "its topic");
+        console.warn(
+          "[topoi] could not file the new thread under",
+          topicName || "its topic",
+          String(error?.message ?? error),
+        );
         return;
       }
       const now = Date.now();
@@ -1210,38 +1135,33 @@ function watchNewThreads() {
     const filed = cachedTopoi(["topoi", "threads"], scopeNow());
     if (filedSessionIds(filed).has(sessionId)) return;
     // The arm has no id yet, so it belongs to the primary draft, and this id is
-    // not necessarily a mint: the strip's "+" docks a chat with no turns, and
-    // filing that now would start fileThread's window with no row to bind, then
-    // let it expire before the first send. Convert the arm and let turns decide.
-    // A draft's send already has its row, so it binds at once; a fresh "+" tab
-    // waits for its first turn.
-    if (pending.home === true && !pending.sessionId) {
-      setPendingThread({ ...pending, awaitTurn: true, sessionId, seenId: sessionId });
-      void settleHomeArm();
-      return;
-    }
-    // The chat the app just minted IS the new thread: adopt it, so the note
-    // follows it into its new tab and its filing waits for the row write the
-    // same way an adopted tab's does.
-    setPendingThread({ ...pending, sessionId, seenId: sessionId });
-    fileAdoptedTab(sessionId, pending.topicId, pending.topicName);
+    // not necessarily a mint: a new chat starts with no turns, and filing that
+    // now would start fileThread's window with no row to bind, then let it expire
+    // before the first send. Convert the arm and let turns decide. A draft's send
+    // already has its row, so it binds at once; a fresh chat waits for its first
+    // turn.
+    // An id-less arm is a draft, home default or sidebar click alike: convert it and let
+    // the first turn file it. Filing here binds an empty chat and clears the arm, which is
+    // the hint flashing and vanishing.
+    setPendingThread({ ...pending, awaitTurn: true, sessionId, seenId: sessionId });
+    void settleHomeArm();
   });
 }
 
 // ---- the home default --------------------------------------------------------
 
-// The home default. A tab the app mints on its own (the strip's "+", the
-// new-session shortcut) has no plugin door: core mints it, so focus is the only
-// signal this half can watch. A mint docks a tile and focuses it, and its id is
-// one this window has never held, which separates it from a switch to an empty
-// tab the user already had.
+// The home default. A chat the app starts on its own (its New session row, ⌘N,
+// ⌘T) has no plugin door: core mints it, so focus is the only signal this half
+// can watch. A mint docks a tile and focuses it, and its id is one this window
+// has never held, which separates it from a switch to an empty chat the user
+// already had.
 //
 // The arm is the sidebar's, except that nothing binds until the draft's first
 // turn. fileThread's retry window starts when it is called, so a tab opened at
 // nine and sent at ten would spend that window on a row that cannot exist yet,
 // then drop the filing without a word.
 
-// The strip can still be mounting its tiles this early, so an id focused in the
+// The layout can still be mounting its tiles this early, so an id focused in the
 // first moments after load is the restore settling, not a mint.
 const HOME_STARTUP_MS = 2000;
 
@@ -1288,7 +1208,7 @@ const filedSessionIds = (threads) => {
   return ids;
 };
 
-// Arms a chat the app minted itself (the strip's "+", the new-session shortcut).
+// Arms a chat the app started itself (its New session row, ⌘N, ⌘T).
 // Only a chat with no turns qualifies: anything else is a conversation the user
 // opened, and filing it under a topic nobody picked is worse than leaving it
 // alone. The primary pane's draft never reaches here, because it has no id until
@@ -1353,10 +1273,11 @@ function cachedTopoi(root, scope) {
 const homeTopicFromCache = () => homeTopic(cachedTopoi(["topoi", "topics"], scopeNow()));
 
 // The ids a draft's mint must not be mistaken for, as far as the cache can tell:
-// the open chat tabs, the focused chat, and every thread the listing carries. The
-// live session listing can name more, so this is upgraded once the arm is set.
+// the chats this window has shown, the focused chat, and every thread the listing
+// carries. The live session listing can name more, so this is upgraded once the
+// arm is set.
 function knownFromCache() {
-  const ids = new Set(openChatTabIds());
+  const ids = new Set(liveChatIds);
   const focused = host.state?.focusedStoredSessionId?.get?.() ?? null;
   if (focused) ids.add(focused);
   for (const id of filedSessionIds(cachedTopoi(["topoi", "threads"], scopeNow()))) {
@@ -1415,7 +1336,7 @@ function armHomeDraft() {
 // listing read takes long enough for a send to land inside it.
 let settlingHome = false;
 let resettleHome = false;
-async function settleHomeArm(departed = false) {
+async function settleHomeArm() {
   // Same reload window as armHomeDefault: a nulled `rest` means the plugin is
   // gone, and fileThread would call it on null.
   if (rest == null) return;
@@ -1430,18 +1351,11 @@ async function settleHomeArm(departed = false) {
     const lookup = await loadTurnLookup();
     const turns = lookup.turns(armed.sessionId);
     if (turns === null || turns === 0) {
-      // Nothing sent. `departed` comes from the focus watcher, after the user has
-      // left the draft: a tab that is gone from the strip was closed unsent, and a
-      // dead arm would block every later mint. Two guards keep that from firing
-      // wrongly. The strips must be readable at all (`tabs.length`), because an
-      // empty read means this desktop's tab markup was not found, not that every
-      // tab closed. And the arm must be older than HOME_STARTUP_MS, because a
-      // restore docks its tiles one at a time and sees the others before this one
-      // mounts.
-      if (departed && Date.now() - armed.at > HOME_STARTUP_MS) {
-        const tabs = openChatTabIds();
-        if (tabs.length > 0 && !tabs.includes(armed.sessionId)) setPendingThread(null);
-      }
+      // Nothing sent yet. A parked arm is superseded, not expired: armDraftIfFronted
+      // clears one before arming a fresh draft, and watchHomeDefault clears one when a
+      // different id is minted and focused. It cannot misfile in the meantime, because
+      // watchNewThreads skips any arm that names a sessionId - it can only file the
+      // chat it names.
       return;
     }
     // A newer arm (a sidebar click) may have landed while the listing was read.
@@ -1477,7 +1391,10 @@ function armDraftIfFronted(attempt = 0) {
   // block this surface through armHomeDefault's "an arm already exists" test. One
   // arm at a time, so the newest surface wins.
   const parked = $pendingThread.get();
-  if (parked?.awaitTurn === true) setPendingThread(null);
+  // Only a parked home default yields here. A sidebar arm names its own topic, and it is
+  // parked waiting for its first turn now, so clearing it would hand the chat to the home
+  // default and silently change the topic the user picked.
+  if (parked?.awaitTurn === true && parked.home === true) setPendingThread(null);
   if ($pendingThread.get()) return;
   if (!homeTopicFromCache()) {
     if (attempt < 2) globalThis.setTimeout(() => armDraftIfFronted(attempt + 1), 120);
@@ -1486,13 +1403,13 @@ function armDraftIfFronted(attempt = 0) {
   armHomeDraft();
 }
 
-// Watches focus for a chat id this window has never held. That set is the sole
-// test, and it grows only from ids focus has visited, never from a later listing,
-// which would make an old chat look like a mint. Seeded from the gateway listing
-// (empty on a refused socket), the open chat tabs and the focused chat, so a
-// restored window starts holding every id it can see. An id is recorded before it
-// is armed, so a declined candidate is never reconsidered and a re-focus cannot
-// loop.
+// Watches focus for a chat id this window has never held. `liveChatIds` is the sole
+// test, and it grows only from ids this window has shown, never from a later
+// listing, which would make an old chat look like a mint. Seeded at register and
+// here from the gateway listing (empty on a refused socket) and the focused chat,
+// so a restored window starts holding every id it can see. An id is recorded
+// before it is armed, so a declined candidate is never reconsidered and a
+// re-focus cannot loop.
 function watchHomeDefault() {
   const focusedAtom = host.state?.focusedStoredSessionId;
   if (!focusedAtom?.listen) return () => {};
@@ -1505,11 +1422,10 @@ function watchHomeDefault() {
   const stopBusy = host.state?.busy?.listen?.(() => {
     void settleHomeArm();
   });
-  const old = new Set(openChatTabIds());
   const start = focusedAtom.get?.() ?? null;
-  if (start) old.add(start);
+  if (start) liveChatIds.add(start);
   void knownSessionIds().then((ids) => {
-    for (const id of ids ?? []) old.add(id);
+    for (const id of ids ?? []) liveChatIds.add(id);
   });
   const settledAfter = Date.now() + HOME_STARTUP_MS;
   // The focus watcher only sees changes, so a reload that lands while the draft is
@@ -1527,9 +1443,8 @@ function watchHomeDefault() {
     // Settled here, where a tile minted earlier has long been docked, rather
     // than on an event which can arrive while one is still mounting. This call
     // suspends on its listing read, so nothing below may clear the arm it is
-    // holding: a send-then-switch would lose the filing. Only its own departed
-    // rule (the tab is gone from the strip) ends a parked arm.
-    void settleHomeArm(true);
+    // holding: a send-then-switch would lose the filing.
+    void settleHomeArm();
     // Nothing focused means the primary pane's draft, the surface the sidebar's
     // New session row and Alt+N both produce. It has no id to key an arm on, so the
     // arm is id-less; watchNewThreads runs first (registered before this watcher),
@@ -1542,8 +1457,8 @@ function watchHomeDefault() {
     }
     // Visited ids are never reconsidered, so a declined candidate cannot come
     // back as a mint and a re-focus cannot loop.
-    const seen = old.has(next);
-    old.add(next);
+    const seen = liveChatIds.has(next);
+    liveChatIds.add(next);
     if (Date.now() < settledAfter) return;
     if (seen || ownChatIds.has(next)) {
       // An id-less arm is only honest while the draft is fronted. Left alive
@@ -2056,12 +1971,22 @@ const ackLocalRead = (rows) => {
 // partial when the backend could not write every id.
 async function markRows(rows) {
   const list = rows ?? [];
-  const ids = list.map((thread) => thread.session_id).filter(Boolean);
-  if (ids.length === 0) return;
+  // Only the rows that still carry a dot: each one costs a fenced write, and a row
+  // already read would be written again for nothing. An absent flag counts as
+  // unread, so a build whose rows predate `unread` marks what it always marked
+  // instead of silently marking nothing.
+  const targets = list.filter((thread) => thread?.unread !== false && thread?.session_id);
+  const ids = targets.map((thread) => thread.session_id);
+  if (ids.length === 0) {
+    // Nothing needs writing, but a row the backend calls read can still paint a
+    // finished marker from this renderer, and only this client can clear it.
+    ackLocalRead(list);
+    return;
+  }
   try {
     const result = await markThreadsRead(ids);
-    // Rows, not ids: the ack needs the lineage root too. Before the refetch, so the
-    // repaint it triggers already sees the cleared dot.
+    // The ack covers the whole scope, not the written rows: `unread` is the backend
+    // watermark, so a read row can still hold a finished marker.
     ackLocalRead(list);
     // Awaited so a caller's pending state spans the repaint, not just the POST.
     await queryClient.invalidateQueries({ queryKey: ["topoi"] });
@@ -2664,6 +2589,7 @@ export default {
   register(ctx) {
     rest = ctx.rest;
     storage = ctx.storage;
+    runAction = typeof ctx.runAction === "function" ? ctx.runAction : null;
     ctx.onDispose(() => {
       // The atom only, so PENDING_THREAD_KEY survives: the durable mirror is what
       // lets a reload or a plugin swap restore an in-flight arm, which
@@ -2671,6 +2597,7 @@ export default {
       $pendingThread.set(null);
       rest = null;
       storage = null;
+      runAction = null;
     });
     const style = document.createElement("style");
     style.textContent = CSS;
@@ -2680,6 +2607,15 @@ export default {
     // An arm a previous session persisted survives the restart or reload
     // that brought this register() back.
     restorePendingThread();
+
+    // The home default's exclusion set, seeded before the first arm can read it:
+    // armHomeDefault reads it through knownFromCache on the very first mint, which
+    // can precede watchHomeDefault's first listing read.
+    const focusedAtLoad = host.state?.focusedStoredSessionId?.get?.() ?? null;
+    if (focusedAtLoad) liveChatIds.add(focusedAtLoad);
+    void knownSessionIds().then((ids) => {
+      for (const id of ids ?? []) liveChatIds.add(id);
+    });
 
     // The home default arms the primary draft from the cache, because the arm has
     // to exist before a send can beat it. Warm both keys here so a collapsed
