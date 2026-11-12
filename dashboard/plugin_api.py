@@ -8,7 +8,7 @@ Routes (CONTRACT.md section 3):
 - ``PUT /topics`` - store a client-sent registry; 422 with the refusal reason on a bad one.
 - ``GET /threads`` - session rows resolved to topics (adapter-minted ``chat_id``, then the binding store, then a cron run's own job delivery lane), paged, newest first; only threads filed under a live topic are listed.
 - ``POST /threads/bind`` - file one session under a topic; re-filing one that is already filed elsewhere needs ``move: true`` (the row menu's Move to topic), so a client-side misfire cannot relocate a thread (409 otherwise).
-- ``POST /threads/read`` - clear the unread watermark on the ids a client sends: core's own ``sessions.last_read_at``, the field the builtin sidebar and the status dot read.
+- ``POST /threads/read`` - mark the ids a client sends read, one public ``PATCH /api/sessions/{id}`` (``{"unread": false}``) per id under a fence this route mints from ``GET /api/sessions/{id}/mutation-snapshot``; the answer is the per-id tally.
 - ``DELETE /threads/{session_id}`` - delete one thread, delegating to the core's own session delete.
 - ``GET /threads/{session_id}/cron`` - one cron result as a document: a mirrored run thread's brief or a run's final answer, plus whether a reply can land and where.
 
@@ -17,10 +17,10 @@ Every registry write broadcasts ``plugin.topoi.topics.changed`` (which reaches d
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import re
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -39,6 +39,12 @@ _MAX_LIMIT = 500
 # A read mark names its ids, so the cap is a body-size guard rather than a page: a caller sends one
 # topic's visible slice, or the union of every section's slice, or the rendered search hits.
 _MAX_READ_IDS = 500
+# Each id is one fenced write, so a batch is capped three ways: 25 ids per chunk, a few writes at
+# once, and a 60s deadline so a click cannot hang.
+_READ_PATCH_CHUNK = 25
+_READ_PATCH_CONCURRENCY = 8
+_READ_PATCH_ID_TIMEOUT_S = 10.0
+_READ_PATCH_DEADLINE_S = 60.0
 # The sources the dashboard itself hides from human listings (kanban board and tool runs); the topic list mirrors that so a topic tree never shows machinery sessions.
 _HIDDEN_SOURCES = ("kanban", "tool")
 
@@ -198,64 +204,143 @@ def _open_db(profile: str | None):
     return _open_session_db_for_profile(profile or None, read_only=True)
 
 
-def _open_write_db(profile: str | None):
-    """A writable handle on the same store, for the read-mark route.
+def _read_request_id() -> str:
+    """A new fence id per attempt: the receipt covers the revision, so a retry cannot reuse it."""
+    import uuid
 
-    The read-only opener above stays the default. Only the watermark write needs this, and it opens
-    without the offline maintenance lock, which a gateway owning the store would refuse.
-    """
-    from hermes_cli.web_server_sessions import _open_session_db_for_profile
-
-    return _open_session_db_for_profile(profile or None, read_only=False)
+    return f"topoi-read-{uuid.uuid4().hex}"
 
 
-def _write_db(request: Request, profile: str | None) -> tuple[Any, bool]:
-    """The store to stamp watermarks on, plus whether the caller must close it.
+async def _read_mark_one(
+    request: Request, profile: str | None, session_id: str
+) -> HTTPException | None:
+    """Mark one id read through core's public fenced ``PATCH /api/sessions/{id}``.
 
-    A composed gateway is the store's only writer, so its own connection answers first; that handle is
-    borrowed for the request and never closed here. With no owner the route opens a writable
-    connection and hands it back through ``release_or_close``. A plain ``close`` would tear the shared
-    generation down under the gateway and any live turn.
+    The route mints the fence: a snapshot gives the revision the owner checks, and the write names that row, so the two agree. ``sidebar`` takes no idle guard, so a live turn never blocks it. A stale revision gets one retry on a fresh snapshot; the refusal is returned, not raised.
 
-    The owner probe is a private core seam, and the dashboard and gateway can sit on different core
-    revisions mid-update, so a probe that cannot run falls back to our own handle rather than failing
-    the button.
+    ``profile`` rides the body because that is where the public model carries it.
     """
     try:
-        from hermes_cli.web_routers.sessions import _owner_db_for
-
-        owner = _owner_db_for(request, profile)
-        if owner is not None:
-            return owner, False
-    except (ImportError, AttributeError):
-        # A core revision that moved the seam degrades instead of 500ing the button. A real failure
-        # still propagates: falling through would open the second writer this probe exists to avoid.
-        logger.warning(
-            "topoi: owner store probe unavailable; opening our own handle",
-            exc_info=True,
+        from hermes_cli.web_models import SessionRename
+        from hermes_cli.web_routers.sessions import (
+            get_session_mutation_snapshot,
+            rename_session_endpoint,
         )
-    return _open_write_db(profile), True
+    except ImportError:
+        # Only an absent module is an upgrade problem; a lazy import failing deeper in core is a bug
+        # and must not be reported as one.
+        return HTTPException(
+            status_code=503,
+            detail="read marks need Hermes >= 0.23.0 (fenced session PATCH)",
+        )
+
+    async def attempt() -> None:
+        snapshot = await get_session_mutation_snapshot(session_id, request, profile)
+        if not snapshot["exists"]:
+            raise HTTPException(status_code=404, detail="not_found")
+        await rename_session_endpoint(
+            session_id,
+            SessionRename(
+                unread=False,
+                request_id=_read_request_id(),
+                expected_revision=snapshot["runtime_revision"],
+                # No generation: sidebar is not an operation that requires one, and a counter it does
+                # not check is only another way to be refused.
+                expected_generation=None,
+                profile=profile,
+            ),
+            request,
+        )
+
+    try:
+        await attempt()
+        return None
+    except HTTPException as exc:
+        if exc.status_code != 409 or exc.detail != "revision_conflict":
+            return exc
+    # One refreshed attempt: a fresh snapshot carries the new revision, and the receipt digest covers
+    # the revision, so the retry mints its own request_id rather than replaying the refused one.
+    try:
+        await attempt()
+        return None
+    except HTTPException as exc:
+        return exc
 
 
-def _mark_threads_read(db: Any, session_ids: list[str]) -> dict[str, Any]:
-    """Clear the read watermark on each id.
+async def _read_mark_batch(
+    request: Request, profile: str | None, session_ids: list[str]
+) -> dict[str, Any]:
+    """Forward each id and tally the answer.
 
-    ``last_read_at`` is lineage-stamped, so the tip and every id in its compression chain agree and a
-    client never has to know which one it held. An id the store will not write (a deleted session, an
-    id from another profile) lands in ``failed`` rather than raising, so one stale row never aborts a
-    whole mark.
+    Chunked so a wide mark does not flood the store, and deadline-bounded so a click cannot hang. Without an in-process owner the batch runs serially, because each write takes the same lock; an owning gateway takes eight at once. If nothing is marked yet the first refusal is raised, and after that each refusal is only that id's answer.
     """
-    marked = 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _READ_PATCH_DEADLINE_S
+    # Without an owner every write takes the exclusive maintenance lock, so a fan-out would leave
+    # all but one refused. Only an owning gateway can take eight.
+    owned = getattr(request.app.state, "session_authority", None) is not None or (
+        getattr(request.app.state, "gateway_runner", None) is not None
+    )
+    semaphore = asyncio.Semaphore(_READ_PATCH_CONCURRENCY if owned else 1)
+    marked: list[str] = []
     failed: list[str] = []
-    for session_id in session_ids:
-        try:
-            if db.set_session_read(session_id, True):
-                marked += 1
-            else:
-                failed.append(session_id)
-        except sqlite3.Error:
+    # A 401 or a busy store aborts only while nothing is marked. A 403 does not abort: one id from
+    # another profile must not stop the rest.
+    abort_refusal: HTTPException | None = None
+    notable_refusal: HTTPException | None = None
+
+    async def bounded(session_id: str) -> HTTPException | None:
+        async with semaphore:
+            budget = min(_READ_PATCH_ID_TIMEOUT_S, deadline - loop.time())
+            if budget <= 0:
+                return HTTPException(status_code=503, detail="read_mark_deadline")
+            try:
+                return await asyncio.wait_for(
+                    _read_mark_one(request, profile, session_id), budget
+                )
+            except HTTPException as exc:
+                # The snapshot step resolves the principal too, so its 401 is this id's answer.
+                return exc
+            except TimeoutError:
+                # The timeout withdraws the await, not a write already inside to_thread, and a late
+                # landing mark is harmless: the watermark only moves forward.
+                return HTTPException(status_code=503, detail="read_mark_deadline")
+            except Exception:
+                logger.warning(
+                    "topoi: read mark failed for %s", session_id, exc_info=True
+                )
+                return HTTPException(status_code=500, detail="read_mark_failed")
+
+    for start in range(0, len(session_ids), _READ_PATCH_CHUNK):
+        chunk = session_ids[start : start + _READ_PATCH_CHUNK]
+        results = await asyncio.gather(*(bounded(session_id) for session_id in chunk))
+        for session_id, refusal in zip(chunk, results):
+            if refusal is None:
+                marked.append(session_id)
+                continue
             failed.append(session_id)
-    return {"ok": not failed, "marked": marked, "failed": failed}
+            if refusal.status_code in (401, 503) and abort_refusal is None:
+                abort_refusal = refusal
+            if (
+                refusal.status_code in (401, 403, 409, 500, 503)
+                and notable_refusal is None
+            ):
+                notable_refusal = refusal
+        if not marked and abort_refusal is not None:
+            logger.warning(
+                "topoi: read mark aborted, %d id(s) refused: %s",
+                len(failed),
+                abort_refusal.detail,
+            )
+            raise abort_refusal
+    if notable_refusal is not None:
+        logger.warning(
+            "topoi: read mark finished %d marked, %d failed; first refusal: %s",
+            len(marked),
+            len(failed),
+            notable_refusal.detail,
+        )
+    return {"ok": not failed, "marked": len(marked), "failed": failed}
 
 
 # A cron run session is minted by the scheduler as `cron_<job id>_<stamp>`; the id
@@ -944,15 +1029,15 @@ async def mark_threads_read(
     also carries renderer state that only the client can clear, so the desktop half acks its own copy
     alongside this call.
 
-    The write skips core's mutation fence, carrying no ``request_id`` and no ``expected_revision``, and
-    never touches ``runtime_revision``, so it cannot wedge a later fenced mutation on that session. In
-    exchange there is no receipt and no ``$unreadWriteGuard``: an in-flight ``session.list`` page can
-    briefly repaint an old dot, and a message landing mid-click is marked read. It is also the only
-    plugin-side write to the session store. Behind a composed gateway ``_write_db`` borrows the
-    owner's connection, but a dashboard process serving a store its gateway also writes is a second
-    writer, so a busy store answers 503 instead of retrying.
+    Each id is forwarded in-process to core's own fenced ``PATCH /api/sessions/{id}`` with
+    ``{"unread": false}``, under the caller's principal and store owner, so the plugin is never a
+    second writer. The fence is minted here from ``GET /api/sessions/{id}/mutation-snapshot``; the
+    client supplies neither ``request_id`` nor a revision. The write carries a receipt and bumps
+    ``runtime_revision``, and ``sidebar`` is a metadata operation, so it never refuses a live turn.
 
-    422 on an empty or over-long id list. Per-id failures come back in ``failed`` rather than raising.
+    422 on an empty or over-long id list. Per-id failures come back in ``failed`` rather than raising;
+    a 401 or a storage refusal before any id is marked aborts with the core's own status. No in-process
+    owner is required: without one the batch runs serially, under the same per-id and deadline bounds.
     """
     raw = (body or {}).get("session_ids")
     if not isinstance(raw, list):
@@ -970,21 +1055,7 @@ async def mark_threads_read(
         raise HTTPException(
             status_code=422, detail=f"at most {_MAX_READ_IDS} session ids per call"
         )
-    db, owned = _write_db(request, profile)
-    try:
-        # Synchronous on purpose: `bind_thread` and `delete_thread` do their store work inline too, and
-        # a thread hop would let a cancelled request release the handle while the worker is still
-        # writing. The set is a handful of single-row updates.
-        return _mark_threads_read(db, ids)
-    except sqlite3.Error as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    finally:
-        if owned:
-            # A writable open is registry-managed, so a plain close would tear the shared generation
-            # down under the gateway and any live turn.
-            from hermes_state_registry import release_or_close
-
-            release_or_close(db)
+    return await _read_mark_batch(request, profile, ids)
 
 
 @router.delete("/threads/{session_id}")
@@ -1011,22 +1082,68 @@ async def delete_thread(
         root = _lineage_root(db, session_id)
     finally:
         db.close()
+
+    def fence_id() -> str:
+        """A new fence id per attempt: the receipt covers the revision, so a retry cannot reuse it."""
+        import uuid
+
+        return f"topoi-delete-{uuid.uuid4().hex}"
+
     # Core's delete endpoint gained a ``request`` parameter (the mutation principal rides it) and
     # the dashboard and the gateway can sit on different core revisions mid-update, so forward the
     # fence only to a core whose signature accepts it.
     params = list(signature(delete_session_endpoint).parameters)
     if params[1:2] == ["request"]:
-        fence = {
-            "request_id": request_id,
-            "expected_revision": expected_revision,
-            "expected_generation": expected_generation,
-        }
-        result = await delete_session_endpoint(
-            session_id,
-            request,
-            profile,
-            **{key: value for key, value in fence.items() if key in params},
-        )
+        from hermes_cli.web_routers.sessions import get_session_mutation_snapshot
+
+        async def attempt(fresh_id: str) -> dict[str, Any]:
+            snapshot = None
+            # A caller's fence wins; the desktop sends none, so this route mints one. Without it
+            # core refuses as client_upgrade_required, which is the 409 every delete used to show.
+            if (
+                request_id is None
+                or expected_revision is None
+                or expected_generation is None
+            ):
+                snapshot = await get_session_mutation_snapshot(
+                    session_id, request, profile
+                )
+                if not snapshot["exists"]:
+                    return {"ok": True, "already_absent": True}
+            revision = (
+                expected_revision
+                if expected_revision is not None
+                else snapshot["runtime_revision"]
+            )
+            # Delete needs a generation where a read mark does not: core refuses a bare revision as
+            # invalid_params (hermes_state_runtime.py:507). The snapshot carries the row's.
+            generation = (
+                expected_generation
+                if expected_generation is not None
+                else snapshot["runtime_generation"]
+            )
+            if generation is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="session_generation_unavailable: this row cannot be deleted under a fence",
+                )
+            return await delete_session_endpoint(
+                session_id,
+                request,
+                profile,
+                request_id=request_id or fresh_id,
+                expected_revision=revision,
+                expected_generation=generation,
+            )
+
+        try:
+            result = await attempt(fence_id())
+        except HTTPException as exc:
+            if exc.status_code != 409 or exc.detail != "revision_conflict":
+                raise
+            # The refreshed attempt needs its own snapshot and its own id for the same reason the
+            # read mark does: the digest covers the revision it names.
+            result = await attempt(fence_id())
     else:
         # An older core takes the profile second; the signature check above is what decides.
         result = await delete_session_endpoint(session_id, profile)  # type: ignore[arg-type]

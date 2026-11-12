@@ -115,13 +115,15 @@ Re-filing a session that already sits under another topic needs `{session_id, to
 
 `DELETE /threads/{session_id}` deletes one thread. The row, its compression chain and its on-disk transcripts go through the core's own session delete - the same handler the desktop's own delete rides - so an already-absent session is a no-op success and a session under an active turn is a 409. The thread's binding is resolved from its lineage root before the row goes and dropped in the same call, so a deleted thread never leaves a binding behind.
 
+The route mints its own fence, because the desktop sends none: an unfenced delete is refused as `client_upgrade_required`, which the app shows as "this app is out of sync (different versions) with the Hermes backend". It reads `GET /api/sessions/{id}/mutation-snapshot` for the revision and the generation, mints a `request_id`, and retries once with a new id on `revision_conflict`. Delete needs a generation where a metadata write does not (`hermes_state_runtime.py:507`), so a row without one answers a named 409 instead of `invalid_params`. A caller that sends its own fence keeps it.
+
 ### 3.6 `POST /threads/read`
 
 `POST /threads/read` with `{session_ids: [...]}` clears the unread watermark on the named threads. Both sidebar read buttons ride it, and the client owns the scope: it sends the ids it is showing, so the route never guesses a topic's set. Ids are deduplicated, non-string entries are dropped, and the answer is `{ok, marked, failed}`, where a per-id refusal (a deleted session, an id from another profile) lands in `failed` with `ok: false` rather than aborting the rest. 422 on a missing, non-list, empty or over-long (500) id list.
 
 The stamp is the same `sessions.last_read_at` watermark, so the tip and its root agree and a client never has to know which id it held. That field backs the builtin sidebar, the status dot and `GET /threads`'s `unread` flag, so the clear is shared rather than plugin-private. A dot also carries renderer state that only the client can clear, which is why the desktop half acks its own copy after this call. `last_read_at` sits in core's change-watcher digest, so every open client hears `sessions.changed` and repaints without a plugin broadcast.
 
-This bypasses core's fenced mutation path: no `request_id` receipt, and no `$unreadWriteGuard`, so an in-flight `session.list` page can briefly repaint an old dot, and a message landing mid-click is marked read. The write never touches `runtime_revision`, so it cannot wedge a later fenced mutation on that session.
+The route never writes the watermark itself. Each id goes in-process to core's fenced `PATCH /api/sessions/{id}` with `{"unread": false}`, under the request's principal and store owner, so the plugin is not a second writer. The fence comes from `GET /api/sessions/{id}/mutation-snapshot`; the write bumps `runtime_revision`, and `sidebar` never refuses a live turn. A message that lands mid-click is still marked read, because the stamp means read-as-of-now. Batches are chunked, run serially without an in-process owner, and stop at the per-id timeout or the overall deadline with a partial answer.
 
 ### 3.7 Broadcasts
 

@@ -1,6 +1,6 @@
 """Backend route check for the topoi REST surface (real router handlers, real store, throwaway HERMES_HOME).
 
-Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, the delete route (row gone, binding dropped), and the read mark (the watermark clearing across a compression chain, an absent id reported rather than raised, and the route's own body cleanup). The store logic (set / clear / prune / sweep) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
+Drives the read paths of ``dashboard/plugin_api.py`` directly (the handlers are plain async functions; the ``include_router`` mount itself is core's) against a seeded state.db: the registry read, the live-topic-only listing with its compression-tip projection, topic resolution from ``chat_id`` and through the binding store, the lineage walk the bind handler resolves roots with, the delete route (row gone, binding dropped), and the read mark (each id forwarded to core's own fenced session PATCH under a snapshot-minted fence, the root and its compression tip both cleared by one mark, an absent id reported rather than raised, a stale revision retried on a fresh request_id, and the route's own body cleanup). The store logic (set / clear / prune / sweep) is covered by check_bindings.py, the registry write and its refusals by check_topic_store.py, and the registry-write-prunes-store composition plus the bind core by check_bindings.py's integration section. Run:
 
     ~/.hermes/hermes-agent/venv/bin/python tests/check_backend.py
 
@@ -16,6 +16,7 @@ import pathlib
 import sys
 import tempfile
 import types
+from typing import Any
 
 import yaml
 
@@ -30,7 +31,7 @@ def check(name: str, ok: bool, detail: object = "") -> None:
         failures.append(name)
 
 
-def fake_request(subject: str = "topoi-check"):
+def fake_request(subject: str = "topoi-check") -> Any:
     """A minimal stand-in for the dashboard Request the plugin handlers forward to core.
 
     Core's session endpoints read the mutation principal off ``request.state`` and the app-level
@@ -108,7 +109,8 @@ def main() -> int:
 
     # The package-import harness (the real web server mounts the file by path, which needs no
     # separate test: the module's topic_store path-load fallback fires either way here).
-    api = load_plugin_api("topoi_backend_checked")
+    # A module loaded by path is untyped, and this block assigns into its seam on purpose.
+    api: Any = load_plugin_api("topoi_backend_checked")
 
     from hermes_state import SessionDB
 
@@ -299,46 +301,65 @@ def main() -> int:
         "an unknown session resolves to None", root_of_missing is None, root_of_missing
     )
 
-    # The delete route: the row goes through the core's own session delete, and the binding the
-    # row was filed under is dropped in the same call. A core that fences session mutations wants
-    # a request_id + expected_revision minted by the owning runtime, which this harness cannot
-    # mint, so that core's delete is exercised by its own client instead.
+    # The delete route mints its own fence now, so this leg runs on a fenced core too. It used to
+    # be skipped here on the grounds that the harness holds no runtime fence, which meant the one
+    # route that was actually broken had no coverage at all.
     if _delete_is_fenced():
-        print(
-            "skip delete-route checks - the installed core fences session mutations "
-            "and this harness holds no runtime fence"
-        )
-    else:
-        deleted = asyncio.run(api.delete_thread("sess_cron2", fake_request()))
-        check(
-            "the delete route reports success",
-            bool(deleted.get("ok")),
-            deleted,
-        )
-        gone_db = SessionDB()
+        from hermes_cli.web_routers.sessions import delete_session_endpoint
+
         try:
-            row_gone = gone_db.get_session("sess_cron2") is None
-        finally:
-            gone_db.close()
-        check("the deleted session's row is gone", row_gone)
-        check(
-            "the deleted thread's binding is dropped",
-            "sess_cron2" not in api.bindings.mapping(),
-            api.bindings.mapping(),
-        )
-        after_delete = asyncio.run(api.get_threads("t_news", 5, 0, None))
-        check(
-            "the deleted thread drops out of the listing",
-            after_delete["total"] == 1
-            and after_delete["threads"][0]["lineage_root"] == "sess_cron",
-            after_delete,
-        )
-        absent = asyncio.run(api.delete_thread("nope", fake_request()))
-        check(
-            "deleting an unknown session is a no-op success",
-            bool(absent.get("ok")),
-            absent,
-        )
+            asyncio.run(delete_session_endpoint("sess_cron2", fake_request(), None))
+        except api.HTTPException as exc:
+            check(
+                "an unfenced delete is refused, so the route must mint the fence",
+                exc.status_code == 409 and "client_upgrade_required" in str(exc.detail),
+                (exc.status_code, exc.detail),
+            )
+        except Exception as error:  # noqa: BLE001 - a wrong exception type is the failure
+            check(
+                "an unfenced delete is refused, so the route must mint the fence",
+                False,
+                f"raised {type(error).__name__}: {error}",
+            )
+        else:
+            check(
+                "an unfenced delete is refused, so the route must mint the fence",
+                False,
+                "accepted",
+            )
+
+    # This leg deletes the seeded row, so everything below it must not expect sess_cron2
+    # to still exist.
+    deleted = asyncio.run(api.delete_thread("sess_cron2", fake_request()))
+    check(
+        "the delete route reports success",
+        bool(deleted.get("ok")),
+        deleted,
+    )
+    gone_db = SessionDB()
+    try:
+        row_gone = gone_db.get_session("sess_cron2") is None
+    finally:
+        gone_db.close()
+    check("the deleted session's row is gone", row_gone)
+    check(
+        "the deleted thread's binding is dropped",
+        "sess_cron2" not in api.bindings.mapping(),
+        api.bindings.mapping(),
+    )
+    after_delete = asyncio.run(api.get_threads("t_news", 5, 0, None))
+    check(
+        "the deleted thread drops out of the listing",
+        after_delete["total"] == 1
+        and after_delete["threads"][0]["lineage_root"] == "sess_cron",
+        after_delete,
+    )
+    absent = asyncio.run(api.delete_thread("nope", fake_request()))
+    check(
+        "deleting an unknown session is a no-op success",
+        bool(absent.get("ok")),
+        absent,
+    )
 
     # ---- scheduled runs file under their job's delivery topic -------------------
     # A cron run is its own session (cron_<job id>_<stamp>, source='cron', no chat_id);
@@ -814,9 +835,11 @@ def main() -> int:
     finally:
         unarchive_seed.close()
 
-    # ---- the read mark: core's own watermark, never a plugin-side table --------------------------
+    # ---- the read mark: core's public fenced session PATCH, never a plugin-side write ------------
     # Fixtures of its own, in the store this block stamps: the rows above belong to the delete and
-    # archive blocks, and reusing them would make this check depend on their order.
+    # archive blocks, and reusing them would make this check depend on their order. Unlike the delete
+    # block above, this one is not skipped on a fenced core: it is the coverage for the fence
+    # handshake, and it mints its own fence from core's snapshot endpoint.
     read_db = SessionDB()
     try:
         read_db.create_session("sess_read", "local", chat_id="")
@@ -830,52 +853,310 @@ def main() -> int:
             "a zeroed watermark reads as unread",
             root_row is not None and read_db.session_unread(root_row) is True,
         )
-        marked = api._mark_threads_read(read_db, ["sess_read"])
-        check(
-            "the read mark clears the watermark",
-            marked["ok"] is True and marked["marked"] == 1 and marked["failed"] == [],
-            marked,
+        revision_before = root_row["runtime_revision"] if root_row else None
+    finally:
+        read_db.close()
+
+    from hermes_cli.web_models import SessionRename
+    from hermes_cli.web_routers.sessions import rename_session_endpoint
+
+    # The client cannot mint the fence, and this is what it would get if it tried: the same handler the
+    # plugin forwards to refuses a bare body, which is why the snapshot handshake is not optional. The
+    # three fence fields are explicitly None because that is exactly what a pre-fence client sends.
+    try:
+        asyncio.run(
+            rename_session_endpoint(
+                "sess_read",
+                SessionRename(
+                    unread=False,
+                    request_id=None,
+                    expected_revision=None,
+                    expected_generation=None,
+                ),
+                fake_request(),
+            )
         )
-        cleared = read_db.get_session("sess_read")
+    except api.HTTPException as exc:
         check(
-            "a cleared row reads as read",
-            cleared is not None and read_db.session_unread(cleared) is False,
+            "an unfenced read mark is refused, so the route must mint a fence",
+            exc.status_code == 409 and "client_upgrade" in str(exc.detail),
+            (exc.status_code, exc.detail),
         )
-        # The bidirectional lineage walk is what makes a tip id unnecessary: root and compression
-        # continuation share one watermark, so a client may send whichever id its row held.
-        read_db.set_session_read("sess_read_tip", False)
-        followed = read_db.get_session("sess_read")
+    else:
         check(
-            "the watermark is shared across the compression chain",
-            followed is not None and read_db.session_unread(followed) is True,
-            "the root did not follow the continuation",
+            "an unfenced read mark is refused, so the route must mint a fence",
+            False,
+            "accepted",
         )
-        api._mark_threads_read(read_db, ["sess_read"])
-        tip_cleared = read_db.get_session("sess_read_tip")
-        check(
-            "marking the root clears its continuation",
-            tip_cleared is not None and read_db.session_unread(tip_cleared) is False,
+
+    # The route end to end, in-process, against the real store and core's real PATCH handler.
+    # ``fake_request`` carries a native principal and no authority, which is core's standalone branch.
+    marked_read = asyncio.run(
+        api.mark_threads_read(
+            {"session_ids": ["sess_read", "sess_read_tip", "sess_no_such_row"]},
+            fake_request(),
         )
-        absent = api._mark_threads_read(read_db, ["sess_no_such_row"])
+    )
+    check(
+        "the read route marks what exists and reports the absent id",
+        marked_read["ok"] is False
+        and marked_read["marked"] == 2
+        and marked_read["failed"] == ["sess_no_such_row"],
+        marked_read,
+    )
+    read_db = SessionDB()
+    try:
+        root_after = read_db.get_session("sess_read")
+        tip_after = read_db.get_session("sess_read_tip")
         check(
-            "an absent id is reported rather than raised",
-            absent["ok"] is False
-            and absent["marked"] == 0
-            and absent["failed"] == ["sess_no_such_row"],
-            absent,
+            "one fenced mark clears the root and its compression tip",
+            root_after is not None
+            and tip_after is not None
+            and read_db.session_unread(root_after) is False
+            and read_db.session_unread(tip_after) is False,
+            (
+                root_after is not None and read_db.session_unread(root_after),
+                tip_after is not None and read_db.session_unread(tip_after),
+            ),
+        )
+        check(
+            "the mark bumps the runtime revision its fence checked",
+            root_after is not None
+            and revision_before is not None
+            and root_after["runtime_revision"] > revision_before,
+            (revision_before, root_after and root_after["runtime_revision"]),
         )
     finally:
         read_db.close()
 
-    # The route's own half: body cleanup, and the no-owner branch `_write_db` takes, which opens our
-    # own writable handle and then releases it.
-    read_route = types.SimpleNamespace(
-        state=types.SimpleNamespace(),
-        app=types.SimpleNamespace(state=types.SimpleNamespace(gateway_runner=None)),
+    # The call shape, on its own: what the route sends to core. The local imports inside
+    # ``_read_mark_one`` re-read the module attributes per call, so patching them here is exact.
+    import hermes_cli.web_routers.sessions as core_sessions
+
+    calls: list[tuple] = []
+
+    async def snapshot_spy(session_id, request, profile=None):
+        calls.append(("snapshot", session_id))
+        return {
+            "session_id": session_id,
+            "exists": True,
+            "runtime_revision": 7,
+            "runtime_generation": None,
+        }
+
+    async def patch_spy(session_id, body, request):
+        calls.append(("patch", session_id, body))
+        return {"ok": True}
+
+    originals = (
+        core_sessions.get_session_mutation_snapshot,
+        core_sessions.rename_session_endpoint,
     )
+    core_sessions.get_session_mutation_snapshot = snapshot_spy
+    core_sessions.rename_session_endpoint = patch_spy
+    try:
+        outcome = asyncio.run(api._read_mark_one(fake_request(), "work", "sess_spy"))
+    finally:
+        (
+            core_sessions.get_session_mutation_snapshot,
+            core_sessions.rename_session_endpoint,
+        ) = originals
+    sent = calls[1][2] if len(calls) > 1 else None
+    check(
+        "the read mark snapshots the id it patches, and only that id",
+        outcome is None
+        and [call[0] for call in calls] == ["snapshot", "patch"]
+        and calls[0][1] == "sess_spy"
+        and calls[1][1] == "sess_spy",
+        calls,
+    )
+    check(
+        "the body carries unread=false, a server-minted request_id and the snapshot revision",
+        sent is not None
+        and sent.unread is False
+        and bool(sent.request_id)
+        and sent.expected_revision == 7
+        and sent.expected_generation is None
+        and sent.profile == "work",
+        None if sent is None else sent.model_dump(),
+    )
+
+    # A stale revision is the one failure a happy path cannot show: it must re-snapshot and mint a new
+    # request_id, because the receipt digest covers the revision.
+    snapshots: list[str] = []
+    patched: list[tuple[str, int]] = []
+
+    async def refresh_snapshot(session_id, request, profile=None):
+        snapshots.append(session_id)
+        return {
+            "session_id": session_id,
+            "exists": True,
+            "runtime_revision": len(snapshots),
+            "runtime_generation": None,
+        }
+
+    async def conflict_once(session_id, body, request):
+        patched.append((body.request_id, body.expected_revision))
+        if len(patched) == 1:
+            raise api.HTTPException(status_code=409, detail="revision_conflict")
+        return {"ok": True}
+
+    core_sessions.get_session_mutation_snapshot = refresh_snapshot
+    core_sessions.rename_session_endpoint = conflict_once
+    try:
+        retried = asyncio.run(api._read_mark_one(fake_request(), None, "sess_retry"))
+    finally:
+        (
+            core_sessions.get_session_mutation_snapshot,
+            core_sessions.rename_session_endpoint,
+        ) = originals
+    check(
+        "a revision conflict is retried on a fresh snapshot",
+        retried is None and len(snapshots) == 2 and len(patched) == 2,
+        (retried, snapshots, patched),
+    )
+    check(
+        "the retry mints a new request_id and the refreshed revision",
+        len(patched) == 2
+        and patched[0][0] != patched[1][0]
+        and patched[0][1] == 1
+        and patched[1][1] == 2,
+        patched,
+    )
+
+    # The batch rules, with the per-id seam faked so each arm is exact.
+    real_one = api._read_mark_one
+
+    def refusing(by_id: dict[str, int]):
+        async def _fake(request, profile, session_id):
+            status = by_id.get(session_id)
+            if status is None:
+                return None
+            return api.HTTPException(status_code=status, detail="refused")
+
+        return _fake
+
+    api._read_mark_one = refusing({"sess_bad": 404})
+    partial = asyncio.run(
+        api.mark_threads_read(
+            {"session_ids": ["sess_a", "sess_bad", "sess_b"]}, fake_request()
+        )
+    )
+    check(
+        "a refused id lands in failed and the rest still mark",
+        partial == {"ok": False, "marked": 2, "failed": ["sess_bad"]},
+        partial,
+    )
+    api._read_mark_one = refusing({"sess_bad": 503})
+    survived = asyncio.run(
+        api.mark_threads_read({"session_ids": ["sess_a", "sess_bad"]}, fake_request())
+    )
+    check(
+        "a storage refusal after progress is that id's answer, not an abort",
+        survived == {"ok": False, "marked": 1, "failed": ["sess_bad"]},
+        survived,
+    )
+    api._read_mark_one = refusing({"sess_only": 503})
+    try:
+        asyncio.run(
+            api.mark_threads_read({"session_ids": ["sess_only"]}, fake_request())
+        )
+    except api.HTTPException as exc:
+        check(
+            "a refusal before anything is marked aborts with the core's status",
+            exc.status_code == 503,
+            exc.status_code,
+        )
+    else:
+        check(
+            "a refusal before anything is marked aborts with the core's status",
+            False,
+            "no error",
+        )
+
+    peak = {"now": 0, "max": 0}
+
+    async def slow_one(request, profile, session_id):
+        peak["now"] += 1
+        peak["max"] = max(peak["max"], peak["now"])
+        await asyncio.sleep(0.01)
+        peak["now"] -= 1
+
+    api._read_mark_one = slow_one
+    many = [f"sess_bulk_{index}" for index in range(60)]
+    owned_request = fake_request()
+    owned_request.app.state.session_authority = object()
+    bulk = asyncio.run(
+        api.mark_threads_read({"session_ids": many}, owned_request, None)
+    )
+    check(
+        "a 60-id mark is chunked under the concurrency cap",
+        bulk["ok"] is True
+        and bulk["marked"] == 60
+        and 1 < peak["max"] <= api._READ_PATCH_CONCURRENCY,
+        (bulk, peak["max"]),
+    )
+    peak["now"] = 0
+    peak["max"] = 0
+    offline = asyncio.run(
+        api.mark_threads_read({"session_ids": many[:12]}, fake_request(), None)
+    )
+    check(
+        "an owner-less store is marked serially, so its lock is never contended",
+        offline["ok"] is True and offline["marked"] == 12 and peak["max"] == 1,
+        (offline, peak["max"]),
+    )
+
+    peak["now"] = 0
+    peak["max"] = 0
+    wide = [f"sess_wide_{index}" for index in range(31)]
+    widened = asyncio.run(
+        api.mark_threads_read({"session_ids": wide}, fake_request(), None)
+    )
+    check(
+        "an owner-less mark wider than a chunk marks every id, serially",
+        widened["ok"] is True and widened["marked"] == 31 and peak["max"] == 1,
+        (widened, peak["max"]),
+    )
+    too_many = [f"sess_cap_{index}" for index in range(api._MAX_READ_IDS + 1)]
+    try:
+        asyncio.run(
+            api.mark_threads_read({"session_ids": too_many}, fake_request(), None)
+        )
+    except api.HTTPException as exc:
+        check(
+            "a mark past the per-call cap is still a bad request",
+            exc.status_code == 422,
+            exc.status_code,
+        )
+    else:
+        check(
+            "a mark past the per-call cap is still a bad request",
+            False,
+            "no error",
+        )
+    api._read_mark_one = real_one
+
+    check(
+        "the read route has no writable store path left",
+        not hasattr(api, "_write_db")
+        and not hasattr(api, "_open_write_db")
+        and not hasattr(api, "_mark_threads_read"),
+        [
+            name
+            for name in ("_write_db", "_open_write_db", "_mark_threads_read")
+            if hasattr(api, name)
+        ],
+    )
+    check(
+        "the read-only opener the listing and search need is still there",
+        hasattr(api, "_open_db"),
+    )
+
+    # The route's own half: body cleanup, over the real seam.
     deduped = asyncio.run(
         api.mark_threads_read(
-            {"session_ids": ["sess_read", "sess_read", None, 7, "   "]}, read_route
+            {"session_ids": ["sess_read", "sess_read", None, 7, "   "]}, fake_request()
         )
     )
     check(
@@ -885,7 +1166,7 @@ def main() -> int:
     )
     for bad_body in ({}, {"session_ids": []}, {"session_ids": "sess_plain"}, []):
         try:
-            asyncio.run(api.mark_threads_read(bad_body, read_route))
+            asyncio.run(api.mark_threads_read(bad_body, fake_request()))
         except api.HTTPException as exc:
             check(
                 f"the read route refuses {bad_body!r}",
