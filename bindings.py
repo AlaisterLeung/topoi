@@ -19,8 +19,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# A binding key is a session's lineage root, the id shape state.db mints; loose on purpose, the store does not re-derive session ids.
-_ROOT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# A binding key is a session's lineage root. The pattern stays loose because the store does not
+# re-derive ids, but it has to cover every shape core mints: 22-33 chars for the timestamped form,
+# 70 for the runtime-minted `local-` plus 64 hex. A 64 cap refused those as a bad id, which is the bind
+# route's 422.
+_ROOT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _DB_NAME = "bindings.db"
 # Below this index size a dead-root sweep is not worth the per-root session lookups; above it, the sweep runs on every bind and unbind.
 _SWEEP_THRESHOLD = 200

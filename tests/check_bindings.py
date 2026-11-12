@@ -140,6 +140,29 @@ def main() -> int:
     else:
         check("a missing topic is refused", False, "accepted")
 
+    long_root = "local-" + "a" * 64
+    try:
+        store.set_binding(long_root, "t_general")
+    except Exception as error:  # noqa: BLE001 - the refusal is the regression
+        check(
+            "a 70-character session id binds",
+            False,
+            f"raised {type(error).__name__}: {error}",
+        )
+    else:
+        check(
+            "a 70-character session id binds",
+            store.mapping().get(long_root) == "t_general",
+            len(long_root),
+        )
+        store.clear_binding(long_root)
+    try:
+        store.set_binding("a" * 129, "t_general")
+    except store.BindingError:
+        check("an over-long session id is still refused", True)
+    else:
+        check("an over-long session id is still refused", False, "accepted")
+
     store.clear_binding("sess_two")
     check("clear removes the binding", store.mapping() == {}, store.mapping())
     store.clear_binding("sess_never")
@@ -339,6 +362,23 @@ def main() -> int:
             store.mapping() == {"sess_test": "t_test", "sess_plain": "t_test"},
             store.mapping(),
         )
+        long_id = "local-" + "b" * 64
+        session_db.create_session(long_id, "local", chat_id="")
+        try:
+            bound_long = api._bind_core(session_db, long_id, "t_news")
+        except Exception as error:  # noqa: BLE001 - a raise here is the 422 this pins
+            check(
+                "a 70-character session id binds through the route core",
+                False,
+                f"raised {type(error).__name__}: {error}",
+            )
+        else:
+            check(
+                "a 70-character session id binds through the route core",
+                bound_long.get("lineage_root") == long_id
+                and store.mapping().get(long_id) == "t_news",
+                bound_long,
+            )
     finally:
         session_db.close()
 
