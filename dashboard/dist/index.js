@@ -118,57 +118,47 @@
     return pool.length > 0 ? pool[0].id : FALLBACK_HOME;
   }
 
-  // Every glyph is imported from the official lucide package on the esm.sh
-  // CDN: the plugin SDK exposes no icon surface (its components map is DS
-  // primitives only), so the bundle fetches icon nodes at runtime instead of
-  // carrying path data. lucide 0.577.0 is the version the dashboard host
-  // itself ships, and the vanilla package exports dependency-free icon nodes,
-  // so no second React copy comes along. A failed import simply leaves its
-  // spot empty. Icons render at 12px, which the DS Button's own
+  // Glyph path data is vendored below instead of fetched at runtime: the plugin
+  // SDK exposes no icon surface (its components map is DS primitives only), and
+  // a signed-in Dashboard must not execute code fetched from a third party. The
+  // data is the lucide icon-node array for the exact glyphs this bundle renders,
+  // at the lucide version the dashboard host itself ships, so the shapes match
+  // the host's own icons. Icons render at 12px, which the DS Button's own
   // [&>svg]:size-3 rule also enforces inside the row actions.
-  const ICON_URLS = {
-    star: "https://esm.sh/lucide@0.577.0/dist/esm/icons/star.js",
-    package: "https://esm.sh/lucide@0.577.0/dist/esm/icons/package.js",
-    "arrow-up": "https://esm.sh/lucide@0.577.0/dist/esm/icons/arrow-up.js",
-    "arrow-down": "https://esm.sh/lucide@0.577.0/dist/esm/icons/arrow-down.js",
-    pencil: "https://esm.sh/lucide@0.577.0/dist/esm/icons/pencil.js",
-    house: "https://esm.sh/lucide@0.577.0/dist/esm/icons/house.js",
-    archive: "https://esm.sh/lucide@0.577.0/dist/esm/icons/archive.js",
-    "archive-restore": "https://esm.sh/lucide@0.577.0/dist/esm/icons/archive-restore.js",
-    "trash-2": "https://esm.sh/lucide@0.577.0/dist/esm/icons/trash-2.js",
-    check: "https://esm.sh/lucide@0.577.0/dist/esm/icons/check.js",
-    x: "https://esm.sh/lucide@0.577.0/dist/esm/icons/x.js",
+  //
+  // Icons: lucide v0.577.0 - ISC
+  // Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2026 as part
+  // of Feather (MIT). All other copyright (c) for Lucide are held by Lucide
+  // Contributors 2026.
+  //
+  // Permission to use, copy, modify, and/or distribute this software for any
+  // purpose with or without fee is hereby granted, provided that the above
+  // copyright notice and this permission notice appear in all copies.
+  //
+  // THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  // WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  // MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+  // SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  // WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+  // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+  // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+  const ICON_NODES = {
+    "star": [["path", {d: "M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"}]],
+    "package": [["path", {d: "M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"}], ["path", {d: "M12 22V12"}], ["polyline", {points: "3.29 7 12 12 20.71 7"}], ["path", {d: "m7.5 4.27 9 5.15"}]],
+    "arrow-up": [["path", {d: "m5 12 7-7 7 7"}], ["path", {d: "M12 19V5"}]],
+    "arrow-down": [["path", {d: "M12 5v14"}], ["path", {d: "m19 12-7 7-7-7"}]],
+    "pencil": [["path", {d: "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"}], ["path", {d: "m15 5 4 4"}]],
+    "house": [["path", {d: "M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"}], ["path", {d: "M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"}]],
+    "archive": [["rect", {width: "20", height: "5", x: "2", y: "3", rx: "1"}], ["path", {d: "M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"}], ["path", {d: "M10 12h4"}]],
+    "archive-restore": [["rect", {width: "20", height: "5", x: "2", y: "3", rx: "1"}], ["path", {d: "M4 8v11a2 2 0 0 0 2 2h2"}], ["path", {d: "M20 8v11a2 2 0 0 1-2 2h-2"}], ["path", {d: "m9 15 3-3 3 3"}], ["path", {d: "M12 12v9"}]],
+    "trash-2": [["path", {d: "M10 11v6"}], ["path", {d: "M14 11v6"}], ["path", {d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"}], ["path", {d: "M3 6h18"}], ["path", {d: "M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"}]],
+    "check": [["path", {d: "M20 6 9 17l-5-5"}]],
+    "x": [["path", {d: "M18 6 6 18"}], ["path", {d: "m6 6 12 12"}]],
   };
 
-  const iconNodes = {};
-
-  function loadIconNode(name) {
-    if (!iconNodes[name]) {
-      iconNodes[name] = import(ICON_URLS[name])
-        .then(function (mod) {
-          return mod.default;
-        })
-        .catch(function () {
-          return null;
-        });
-    }
-    return iconNodes[name];
-  }
-
   function Icon(props) {
-    const [node, setNode] = useState(null);
-    useEffect(
-      function () {
-        let alive = true;
-        loadIconNode(props.name).then(function (loaded) {
-          if (alive) setNode(loaded);
-        });
-        return function () {
-          alive = false;
-        };
-      },
-      [props.name],
-    );
+    const node = ICON_NODES[props.name];
     if (!node) return null;
     return e(
       "svg",
